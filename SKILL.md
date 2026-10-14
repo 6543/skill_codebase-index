@@ -5,134 +5,121 @@ description: Structural code search, call-graph tracing and indexing using tree-
 
 # Codebase Index
 
-Grep answers "which lines contain this text". Most questions about unfamiliar
-code are not that. They are "what does this type own", "what does this
-interface require", "why was this written this way", "where does control go
-next" — questions about structure, which live in the syntax tree rather than in
-the text.
+Grep answer "which lines contain this text". Most codebase questions not that.
+They are "what this type own", "what this interface require", "why written this
+way", "where control go next". Structure questions. Structure live in syntax
+tree, not in text.
 
-`scripts/ts_query.py` parses source with tree-sitter and queries the tree. It
-returns whole declarations with their doc comments attached, so a single call
-usually replaces several rounds of grep-then-read-with-context.
+`scripts/ts_query.py` parse source with tree-sitter, query tree. Return whole
+declarations, doc comments attached. One call replace many rounds of
+grep-then-read-with-context.
 
 ## Setup
 
-The tool needs `tree_sitter` plus one grammar package per language. Check what
-is present before doing anything else:
+Need `tree_sitter` plus one grammar package per language. Check first:
 
 ```bash
 python3 scripts/ts_query.py langs
 ```
 
-Any missing grammar is printed with the exact `pip install` line to fix it.
-Missing grammars are not fatal — files in those languages are skipped and a note
-goes to stderr. Install only the languages the repo actually contains; `map`
-tells you which those are.
+Missing grammar print exact `pip install` line. Missing not fatal: those files
+skipped, note to stderr. Install only languages repo contain. `map` tell which.
 
-## Workflow for exploring an unfamiliar repo
+## Workflow for unfamiliar repo
 
-Work outside in. Each step narrows the next.
+Work outside in. Each step narrow next.
 
-**1. Map it.** Language mix, size, and where the declarations are concentrated:
+**1. Map it.** Language mix, size, where declarations cluster:
 
 ```bash
 python3 scripts/ts_query.py map /path/to/repo
 ```
 
-The "densest files" list is the useful part — files with the most declarations
-are usually the API surface (`store.go`, `api/index.ts`, `interface.go`) rather
-than the busiest logic. Read those first.
+"Densest files" list is useful part. Most declarations usually mean API surface
+(`store.go`, `api/index.ts`, `interface.go`), not busiest logic. Read those first.
 
-**2. Outline the files that matter.** Module header, imports, types with their
-members, constants, and free functions, each with its doc comment:
+**2. Outline files that matter.** Module header, imports, types with members,
+constants, free functions. Each with doc comment:
 
 ```bash
 python3 scripts/ts_query.py outline path/to/file.go
 ```
 
-**3. Follow the thread.** Pick the command that matches the question:
+**3. Follow thread.** Pick command matching question:
 
 | Question | Command |
 |---|---|
-| What does this declaration actually say? | `decl <Name> <root>` |
-| Who calls this? | `refs <Name> <root>` |
-| What does this contract require? | `iface <Name> <root>` |
-| What does this type own? | `methods <Type> <root>` |
-| What data does this hold, with tags? | `fields <Type> <root>` |
-| What are the enum values / constants? | `consts <root>` |
-| What did the authors flag as unfinished? | `todos <root>` |
-| What satisfies this interface? | `impls <Iface> <root>` |
-| What happens when this runs, several hops out? | `trace <Name> <root>` |
-| What reaches this, several hops back? | `trace <Name> <root> --callers` |
-| Where does the thread of control get dropped? | `effects <root>` |
-| Which functions are hardest to follow? | `complexity <root>` |
-| Are there circular imports? | `cycles <root>` |
+| What this declaration actually say? | `decl <Name> <root>` |
+| Who call this? | `refs <Name> <root>` |
+| What this contract require? | `iface <Name> <root>` |
+| What this type own? | `methods <Type> <root>` |
+| What data this hold, with tags? | `fields <Type> <root>` |
+| What enum values / constants? | `consts <root>` |
+| What authors flag unfinished? | `todos <root>` |
+| What satisfy this interface? | `impls <Iface> <root>` |
+| What happen when this run, several hops out? | `trace <Name> <root>` |
+| What reach this, several hops back? | `trace <Name> <root> --callers` |
+| Where thread of control get dropped? | `effects <root>` |
+| Which functions hardest to follow? | `complexity <root>` |
+| Circular imports? | `cycles <root>` |
 
-`<root>` is a file or a directory; directories are walked recursively.
+`<root>` = file or directory. Directories walked recursively.
 
-**4. When one hop is not enough, trace.** `refs` answers "who calls this";
-`trace` follows the answer onward and prints the result as a tree:
+**4. One hop not enough → trace.** `refs` answer "who call this". `trace` follow
+answer onward, print tree:
 
 ```bash
 python3 scripts/ts_query.py trace Reconcile /path/to/repo --depth=2
 python3 scripts/ts_query.py trace Reconcile /path/to/repo --callers
 ```
 
-Every edge carries a confidence label and the `file:line` it was read from.
-Edges that syntax alone cannot settle are not drawn: they are listed underneath,
-with their candidates, under `unresolved`. That block is often the most
-informative part of the output, because it is where the interfaces are.
+Every edge carry confidence label plus `file:line` it came from. Edges syntax
+cannot settle are not drawn. They listed below, with candidates, under
+`unresolved`. That block often most informative part: interfaces live there.
 
-**5. Check what the graph cannot carry.** A call graph shows that A reaches B.
-It does not show that B runs on another goroutine, that the value arrived
-through a channel, or that it was a different type before it crossed a JSON
-boundary:
+**5. Check what graph cannot carry.** Call graph show A reach B. Not show B run
+on other goroutine, value arrive through channel, value was different type
+before crossing JSON boundary:
 
 ```bash
 python3 scripts/ts_query.py effects /path/to/repo --kind=boundary
 ```
 
-Kinds are `spawn` (goroutine, await, defer, thread pool), `channel` (Go sends
-and receives), `boundary` (encode/decode pairs), and `callback` (a function
-handed to something that will call it later). Read
-[references/tracing.md](references/tracing.md) before drawing conclusions from a
-trace of anything asynchronous.
+Kinds: `spawn` (goroutine, await, defer, thread pool), `channel` (Go send and
+receive), `boundary` (encode/decode pair), `callback` (function handed to
+something that call it later). Read [references/tracing.md](references/tracing.md)
+before concluding anything from trace of async code.
 
-## Why these beat the grep equivalent
+## Why these beat grep equivalent
 
-- `decl` returns the **whole declaration**, bounded by the syntax tree, plus the
-  doc comment above it. `grep -C 20` guesses at the boundary and cuts long
-  functions in half.
-- `methods` disambiguates by **receiver**. Grepping a common method name like
-  `Poll` across a repo returns every type's version plus the generated mocks;
-  `methods fifo` returns exactly one type's set.
-- `iface` lists what a contract requires **with each method's doc comment**.
-  This is where design rationale usually lives, and grep has no way to associate
-  a comment with the thing it documents.
-- `refs` keeps the **full qualifier** (`p.q.Poll` vs `s.scheduler.Poll`) and
-  names the enclosing declaration, so a call list doubles as a call graph sketch.
-- `todos` attributes each marker to the declaration containing it, which turns a
-  flat list into a map of known debt.
-- `impls` derives implementors from method sets — there is no textual pattern
-  for "this type satisfies that interface" in Go or Rust.
-- `trace` keeps following. Reading a call chain by hand costs one `refs` and one
-  file read per hop, and the hop that gets skipped is usually the one that
-  mattered.
-- `effects` finds the handoffs that break a trace: a goroutine, a channel, an
-  encoder, a handler passed to a router. None of these has a textual signature
-  worth grepping for, and every one of them is a place a confident-looking trace
-  quietly stops being true.
+- `decl` return **whole declaration**, bounded by syntax tree, plus doc comment
+  above it. `grep -C 20` guess boundary, cut long functions in half.
+- `methods` disambiguate by **receiver**. Grep common method name like `Poll`
+  return every type's version plus generated mocks. `methods fifo` return one
+  type's set.
+- `iface` list contract requirements **with each method's doc comment**. Design
+  rationale live there. Grep cannot tie comment to thing it document.
+- `refs` keep **full qualifier** (`p.q.Poll` vs `s.scheduler.Poll`) and name
+  enclosing declaration. Call list double as call-graph sketch.
+- `todos` attribute each marker to containing declaration. Flat list become map
+  of known debt.
+- `impls` derive implementors from method sets. No textual pattern exist for
+  "this type satisfy that interface" in Go or Rust.
+- `trace` keep following. Hand-walking a chain cost one `refs` plus one file read
+  per hop, and skipped hop usually the one that mattered.
+- `effects` find handoffs that break a trace: goroutine, channel, encoder,
+  handler passed to router. None have textual signature worth grepping. Each one
+  is place where confident-looking trace quietly stop being true.
 
-Test files, generated mocks, and files whose header marks them as machine-
-written are excluded by default because they dominate results and rarely answer
-the question. Add `--tests` or `--mocks` when they are what you want. Credential
-files (`.env*`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`) are never read at
-all, and files over 2 MB are skipped as data rather than source.
+Test files, generated mocks, files with machine-written header: excluded by
+default. They dominate results, rarely answer question. Add `--tests` or
+`--mocks` when wanted. Credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`,
+`credentials.json`) never read at all. Files over 2 MB skipped as data, not source.
 
 ## Confidence labels
 
-`refs` and `trace` cannot resolve types, so instead of silently guessing they
-label every edge with how much the answer can be trusted:
+`refs` and `trace` cannot resolve types. Instead of guessing silently, they label
+every edge with how much the answer can be trusted:
 
 | Label | Meaning |
 |---|---|
@@ -142,20 +129,20 @@ label every edge with how much the answer can be trusted:
 
 `trace` is stricter than `refs`: where several candidates survive, it draws no
 edge at all and lists the call under `unresolved` with every candidate. A call
-naming an interface member is separated out as `dispatch`, because that is not
-an ambiguity to be broken by better ranking — the target is chosen at runtime
-and is not written down anywhere in the file.
+naming an interface member is separated out as `dispatch`, because that is not an
+ambiguity to be broken by better ranking — the target is chosen at runtime and is
+not written down anywhere in the file.
 
 Ranking uses two positional signals, not type information: production code is
-assumed not to call test fixtures, and a nearer declaration in the directory
-tree beats a distant one. A qualified call such as `p.q.Poll` inside a method
-also named `Poll` excludes that enclosing method, since it is dispatching on a
+assumed not to call test fixtures, and a nearer declaration in the directory tree
+beats a distant one. A qualified call such as `p.q.Poll` inside a method also
+named `Poll` excludes that enclosing method, since it is dispatching on a
 different receiver. A qualified call whose head names an imported package that
 resolves outside the repo (`rand.New`) is dropped rather than matched against a
 same-named local declaration.
 
-Report the label alongside the finding. An `AMBIGUOUS` result presented as
-fact is worse than no result.
+Report the label alongside the finding. An `AMBIGUOUS` result presented as fact
+is worse than no result.
 
 ## Filters
 
@@ -173,36 +160,34 @@ fact is worse than no result.
 --max-bytes=<n>  skip files larger than n bytes (default 2000000)
 ```
 
-`.gitignore` is honoured by default, including negation rules and per-directory
-files, so generated and vendored code stays out of results without needing a
-hardcoded exclusion list. Lockfiles are always skipped.
+`.gitignore` honoured by default: negation rules, per-directory files. Generated
+and vendored code stay out with no hardcoded exclusion list. Lockfiles always
+skipped.
 
 ## Session state
 
-Parse results are cached in memory for the lifetime of a single command, which
-keeps repo-wide commands from re-parsing the same files. Nothing is written to
-disk. This is a helper you run against the code as it is right now, not an index
-to build and keep in sync — so there is no staleness to reason about, and no
-cache to invalidate after an edit.
+Parse results cached in memory for lifetime of one command, so repo-wide commands
+do not re-parse same file. Nothing written to disk. This is helper run against
+code as it is right now, not index to build and sync. No staleness to reason
+about, no cache to invalidate after edit.
 
 ## Reporting findings
 
-When tracing a code path, cite `file:line` for each hop so the user can jump
-straight there, and quote the doc comment when it explains a decision — that is
-usually the part worth surfacing. Say plainly when something could not be
-resolved rather than inferring it; see the limits below.
+Cite `file:line` per hop so user jump straight there. Quote doc comment when it
+explain a decision: usually the part worth surfacing. Say plainly when something
+could not be resolved instead of inferring. See limits below.
 
 ## Limits worth stating out loud
 
-This is syntactic analysis, not semantic. It does not resolve types, so:
+Syntactic analysis, not semantic. It does not resolve types, so:
 
 - `refs` matches the trailing identifier of a call. It shows `p.q.Poll` but
   cannot prove `p.q` is a `*fifo`. Same-named methods on different types collide.
 - `trace` is built from those same edges, so its reach is bounded by them. A
   reflected call, a call through a generated client, a handler resolved from a
   string route table, and an interface with several implementors all end the
-  chain. They end it *visibly*, in the `unresolved` block, rather than silently
-   — but an empty `unresolved` block is not proof that nothing was missed.
+  chain. They end it *visibly*, in the `unresolved` block, rather than silently —
+  but an empty `unresolved` block is not proof that nothing was missed.
 - `effects` detects channels in Go only, and reports a callback whenever an
   argument names a function declared in this repo, so a local variable that
   shadows a function name shows up as one.
@@ -213,15 +198,15 @@ This is syntactic analysis, not semantic. It does not resolve types, so:
   missed, so a reported cycle is solid evidence but an empty result is not proof
   of absence.
 - `complexity` counts branch points structurally. It measures how many paths a
-  reader must follow, which correlates with but is not the same as difficulty:
-  a long flat switch scores high and is easy to read.
+  reader must follow, which correlates with but is not the same as difficulty: a
+  long flat switch scores high and is easy to read.
 - Single-file components (`.vue`, `.svelte`) are parsed by extracting every
-  `<script>` block and parsing each as TypeScript. Line numbers are offset back
-  to the real file, but template markup is not analysed — so a handler bound
-  only in the template has no visible caller.
-- Kotlin's grammar represents interfaces as `class_declaration`, so `outline`
-  does not label them separately. Dart and Elixir are not supported: their
-  grammars do not expose declaration names in a usable form.
+  `<script>` block and parsing each as TypeScript. Line numbers are offset back to
+  the real file, but template markup is not analysed — so a handler bound only in
+  the template has no visible caller.
+- Kotlin's grammar represents interfaces as `class_declaration`, so `outline` does
+  not label them separately. Dart and Elixir are not supported: their grammars do
+  not expose declaration names in a usable form.
 - Nix has no functions, classes or interfaces in the C sense, so `iface`,
   `methods`, `fields` and `impls` do not apply. `outline`, `decl`, `refs`,
   `trace`, `consts`, `todos`, `complexity` and `cycles` all work, and for Nix
@@ -235,26 +220,25 @@ guessing.
 
 ## Adding a language
 
-Grammars vary, so verify before writing a spec rather than guessing node names:
+Grammars vary. Verify before writing spec, do not guess node names:
 
 ```bash
 python3 scripts/ts_query.py debug-ast sample.ext --depth=3
 ```
 
-Then add a `LangSpec` to `scripts/languages.py` listing the node types that
-carry each concept. Most grammars expose the same field names (`name`,
-`parameters`, `body`, `type`, `return_type`), which is why one generic extractor
-covers all of them; set `name_hook` only where a grammar deviates, as C and C++
-do by burying the function name in the declarator chain.
+Then add `LangSpec` to `scripts/languages.py` listing node types carrying each
+concept. Most grammars expose same field names (`name`, `parameters`, `body`,
+`type`, `return_type`), so one generic extractor cover all. Set `name_hook` only
+where grammar deviate, as C and C++ do by burying function name in declarator
+chain.
 
-See `references/languages.md` for per-language coverage and known quirks, and
-`references/tracing.md` for how to read a trace without over-claiming.
+Per-language coverage and quirks: `references/languages.md`. How to read a trace
+without over-claiming: `references/tracing.md`.
 
 ## Tests
 
-`python3 -m unittest discover -s scripts/tests -t scripts` builds throwaway
-repos and asserts the behaviours this document promises: receiver
-disambiguation, the confidence labels, refusal to resolve interface dispatch,
-credential exclusion, and the Nix and single-file-component quirks. Run it after
-changing a `LangSpec` — a wrong node type usually produces plausible output
-rather than an error.
+`python3 -m unittest discover -s scripts/tests -t scripts` build throwaway repos,
+assert behaviours this document promise: receiver disambiguation, confidence
+labels, refusal to resolve interface dispatch, credential exclusion, Nix and
+single-file-component quirks. Run after changing a `LangSpec`. Wrong node type
+usually produce plausible output, not error.

@@ -1,8 +1,8 @@
 # Language coverage and quirks
 
-Every node type in `scripts/languages.py` was verified by parsing real code with
-the actual grammar, not taken from documentation. If you extend the registry,
-do the same — run `debug-ast` first.
+Every node type in `scripts/languages.py` verified by parsing real code with the
+actual grammar, not read from docs. Extending registry? Do same. Run `debug-ast`
+first.
 
 ## Contents
 
@@ -19,7 +19,7 @@ do the same — run `debug-ast` first.
 | TypeScript | `.ts .mts .cts` | `tree_sitter_typescript` | yes | `//`, `/** */` | interfaces, type aliases, enums, classes |
 | TSX | `.tsx` | `tree_sitter_typescript` | yes | same | separate grammar entry point |
 | JavaScript | `.js .jsx .mjs .cjs` | `tree_sitter_javascript` | n/a | same | named arrow functions resolved via assignment |
-| Vue 3 | `.vue` | `tree_sitter_typescript` | yes | same | `<script setup>` extracted; template not analysed |
+| Vue 3 | `.vue` | `tree_sitter_typescript` | yes | same | every `<script>` block extracted; template not analysed |
 | Svelte | `.svelte` | `tree_sitter_typescript` | yes | same | same script-extraction approach |
 | Rust | `.rs` | `tree_sitter_rust` | traits | `///`, `//!` | `impl` blocks attributed to their type |
 | Python | `.py .pyi` | `tree_sitter_python` | n/a | docstrings | docstring read from the body's first string |
@@ -40,30 +40,28 @@ do the same — run `debug-ast` first.
 
 ### Nix
 
-Nix is the one target that does not fit the class/method/interface shape the
-other specs assume, and pretending otherwise produced bad output until each of
-these was handled:
+Nix is one target not fitting class/method/interface shape other specs assume.
+Pretending otherwise gave bad output until each of these handled:
 
-- **Bindings, not functions.** `name = expr;` is the only declaration form, so
-  bindings are registered as `defs` and rendered as `name = value`. Rendering
-  them as `name()` invented a call signature that does not exist in the source.
-- **Imports are ordinary function applications.** There is no import node type;
-  `import ./foo.nix` is an `apply_expression`. Registering `apply_expression` as
-  the import type meant every call in the file was reported as an import, which
-  dumped whole files into the outline. `import_hook="nix_import"` narrows it to
-  applications whose function is literally `import`.
-- **Attribute sets nest arbitrarily deep.** A NixOS test has hundreds of nested
-  bindings; listing them all buries the two or three that describe the file.
-  `top_level_only` keeps the outermost bindings in `outline`, while `decl` still
-  finds anything nested by name.
-- **Hyphens are identifier characters.** `mysql-replication` is one name. The
-  qualifier splitter used to treat `-` as a member separator and truncated it to
+- **Bindings, not functions.** `name = expr;` is only declaration form. Bindings
+  registered as `defs`, rendered `name = value`. Rendering as `name()` invented
+  call signature not in source.
+- **Imports are ordinary applications.** No import node type exists.
+  `import ./foo.nix` is `apply_expression`. Registering `apply_expression` as
+  import type reported every call as import, dumping whole files into outline.
+  `import_hook="nix_import"` narrow to applications whose function literally
+  `import`.
+- **Attribute sets nest deep.** NixOS test have hundreds of nested bindings.
+  Listing all bury the two or three describing the file. `top_level_only` keep
+  outermost bindings in `outline`. `decl` still find nested by name.
+- **Hyphens are identifier characters.** `mysql-replication` is one name.
+  Qualifier splitter used to treat `-` as member separator, truncating to
   `replication`.
-- **Attribute access is reference.** `nixosTests.mysql` is a `select_expression`,
-  not an application, so `refs` covers both. In a purely functional language
-  there is no distinction between using a value and calling it.
-- **Package functions take dozens of arguments.** A 51-argument formal list is
-  noise in an outline, so it is summarised as `{ 51 args }`.
+- **Attribute access is reference.** `nixosTests.mysql` is `select_expression`,
+  not application, so `refs` cover both. Purely functional language draw no line
+  between using a value and calling it.
+- **Package functions take dozens of arguments.** 51-argument formal list is
+  outline noise. Summarised as `{ 51 args }`.
 
 ### Not supported
 
@@ -72,85 +70,80 @@ these was handled:
 | Dart | methods parse as bare `declaration` nodes with no usable name field; output was `<anonymous>` rows |
 | Elixir | the grammar models `defmodule`/`def`/`defp` as generic `call` nodes with `do_block`, so declarations are indistinguishable from ordinary function calls without a bespoke pass |
 
-Both are better left out than shipped producing plausible-looking noise. If
-either grammar gains proper declaration nodes, revisit.
+Better left out than shipped producing plausible noise. Revisit if either grammar
+gain proper declaration nodes.
 
 ## Per-language notes
 
 ### Go
 
-The most complete target. `methods <Type>` matches on the receiver, so it
-separates `(q *fifo) Poll` from `(p *impl) Poll` — something grep cannot do.
-Struct tags are preserved verbatim in `fields`, which matters for ORM and JSON
-mapping questions. `outline` surfaces `//go:build` lines, which explains cases
-like a package reporting "no test files" when its tests sit behind a build tag.
+Most complete target. `methods <Type>` match on receiver, separating
+`(q *fifo) Poll` from `(p *impl) Poll`. Grep cannot. Struct tags preserved
+verbatim in `fields`: matters for ORM and JSON mapping questions. `outline`
+surface `//go:build` lines, explaining cases like package reporting "no test
+files" when tests sit behind build tag.
 
-Interface methods are `method_elem` nodes, not `method_declaration`, so they are
-registered as defs to make `iface` work.
+Interface methods are `method_elem`, not `method_declaration`, so registered as
+defs to make `iface` work.
 
 ### Rust
 
-`impl Type` and `impl Trait for Type` blocks are containers: their functions are
-attributed to the implementing type, not reported as free functions. `impls`
-works well here because trait satisfaction is structural.
+`impl Type` and `impl Trait for Type` blocks are containers. Their functions
+attributed to implementing type, not reported as free functions. `impls` work
+well here: trait satisfaction is structural.
 
-Rust line comments include the trailing newline in their extent while Go's do
-not, so doc-comment attachment tests for line overlap rather than exact
-adjacency. Keep that in mind if adding a grammar with a third convention.
+Rust line comments include trailing newline in extent, Go's do not. So
+doc-comment attachment test line overlap, not exact adjacency. Remember when
+adding grammar with third convention.
 
 ### Python
 
-There is no separate declaration for a constant, so module-level assignments are
-reported as constants and class-level ones as fields. Assignments inside method
-bodies (`self.x = y`) are deliberately excluded — they belong to the method's
-scope, not the class's surface.
+No separate constant declaration exists. Module-level assignments reported as
+constants, class-level as fields. Assignments inside method bodies (`self.x = y`)
+excluded on purpose: they belong to method scope, not class surface.
 
-Docstrings are read from the first string expression in the body rather than
-from preceding comments.
+Docstrings read from first string expression in body, not from preceding
+comments.
 
 ### Vue and Svelte
 
-No maintained Python wheel exists for either grammar, so `<script>` blocks are
-extracted with a regex and parsed as TypeScript. Line numbers are offset back to
-the original file and are exact.
+No maintained Python wheel exist for either grammar. `<script>` blocks extracted
+with regex, parsed as TypeScript. Line numbers offset back to original file,
+exact.
 
-**Every** script block is parsed, not just the first. Vue 3 routinely pairs
-`<script setup>` with a plain `<script>` holding options or a named export, and
-Svelte pairs the instance script with `context="module"`; reading only the first
-match silently dropped whichever came second. `outline` labels each block when a
-file has more than one.
+**Every** script block parsed, not just first. Vue 3 routinely pair
+`<script setup>` with plain `<script>` holding options or named export. Svelte
+pair instance script with `context="module"`. Reading only first match silently
+dropped whichever came second. `outline` label each block when file have more
+than one.
 
-Template markup and styles are not analysed. A handler bound only in the
-template therefore has no visible caller, which is the commonest way a `refs` or
-`trace` result on a component is misleading.
+Template markup and styles not analysed. Handler bound only in template have no
+visible caller: commonest way a `refs` or `trace` result on a component mislead.
 
 ### JavaScript and TypeScript
 
-Anonymous callbacks — `computed(() => ...)`, `.map(x => ...)` — are control flow
-rather than API surface, so they are dropped instead of being listed as
-`<anonymous>`. Arrow functions bound to a name (`const handler = () => {}`) are
-kept and named after the binding.
+Anonymous callbacks (`computed(() => ...)`, `.map(x => ...)`) are control flow,
+not API surface. Dropped, not listed as `<anonymous>`. Arrow functions bound to
+name (`const handler = () => {}`) kept, named after binding.
 
-A `const` holding a function body is collapsed to a preview; a `const` group of
-plain values is printed in full, since enum-style groups are usually the reason
-someone is looking.
+`const` holding function body collapse to preview. `const` group of plain values
+print in full: enum-style groups usually the reason someone look.
 
 ### C and C++
 
-The function name and parameter list are nested inside the declarator chain
-rather than exposed as fields, which is what `name_hook="c_declarator"` handles.
-Preprocessor macros are reported as constants; there is no attempt to expand
-them.
+Function name and parameter list nest inside declarator chain, not exposed as
+fields. That is what `name_hook="c_declarator"` handle. Preprocessor macros
+reported as constants. No expansion attempted.
 
 ### Kotlin
 
-The grammar models interfaces as `class_declaration` with a modifier, so
-`outline` cannot label them separately and `iface` will not find them. Method
-and property extraction works normally.
+Grammar model interfaces as `class_declaration` with modifier. `outline` cannot
+label them separately, `iface` will not find them. Method and property extraction
+work normally.
 
 ## Concepts and how they map
 
-Each `LangSpec` lists node types per concept:
+Each `LangSpec` list node types per concept:
 
 | Field | Meaning |
 |---|---|
@@ -166,8 +159,8 @@ Each `LangSpec` lists node types per concept:
 | `name_hook` | `c_declarator`, `js_assigned`, or `python_doc` |
 | `sfc` | set when the file is a single-file component |
 
-Four registries sit alongside the specs rather than inside them, because they
-are language-agnostic sets that every grammar contributes to:
+Four registries sit beside specs, not inside: language-agnostic sets every
+grammar contribute to.
 
 | Registry | Used by | Contents |
 |---|---|---|
@@ -176,65 +169,58 @@ are language-agnostic sets that every grammar contributes to:
 | `SPAWN_NODES`, `SPAWN_CALLEES` | `effects` | goroutine, await, defer, thread pool |
 | `SERIALIZATION_CALLEES` | `effects` | encode/decode pairs across the ecosystem |
 
-A grammar that lacks one of these node types simply never hits it, which is why
-one set covers all languages.
+Grammar lacking one of these node types simply never hit it. That is why one set
+cover all languages.
 
-Interface members are recognised either by node type (`method_elem`,
-`method_signature`, `function_signature_item`) or, for grammars that give
-interface methods the same node type as ordinary ones — Java is the case that
-matters — by checking the enclosing type against the spec's `ifaces`.
+Interface members recognised by node type (`method_elem`, `method_signature`,
+`function_signature_item`), or, for grammars giving interface methods same node
+type as ordinary ones (Java is the case that matters), by checking enclosing type
+against spec's `ifaces`.
 
 ## Adding a language
 
-1. Install the grammar: `pip install tree_sitter_<lang>`.
-2. Write a small sample file exercising a class, an interface, a function, a
-   constant, a field, and a doc comment.
-3. Dump the tree: `python3 scripts/ts_query.py debug-ast sample.ext --depth=3`.
-   This prints node types with their `name`/`parameters`/`type`/`body` fields.
-4. Add a `LangSpec` mapping each concept to the node types you observed.
-5. Re-run `outline` on the sample and confirm every element appears once, in the
-   right section, with its doc comment.
+1. Install grammar: `pip install tree_sitter_<lang>`.
+2. Write small sample exercising class, interface, function, constant, field, doc
+   comment.
+3. Dump tree: `python3 scripts/ts_query.py debug-ast sample.ext --depth=3`. Print
+   node types with `name`/`parameters`/`type`/`body` fields.
+4. Add `LangSpec` mapping each concept to node types observed.
+5. Re-run `outline` on sample. Confirm every element appear once, right section,
+   with doc comment.
 
-Two failure modes are worth checking explicitly, because both produce
-plausible-looking wrong output:
+Two failure modes worth explicit check. Both produce plausible-looking wrong
+output:
 
-- **Keyword collision.** In some grammars an anonymous keyword token shares its
-  type name with a real node (Ruby's `class`, `module`). The walker only yields
-  named nodes, which handles this — but if you see every declaration twice, this
-  is why.
-- **Comment extent.** Grammars disagree on whether a line comment includes its
-  trailing newline. If doc comments come back empty, compare the comment's
-  `start_point`/`end_point` against the declaration's `start_point`.
-
+- **Keyword collision.** Some grammars have anonymous keyword token sharing type
+  name with real node (Ruby `class`, `module`). Walker yield only named nodes,
+  which handle it. Seeing every declaration twice? This is why.
+- **Comment extent.** Grammars disagree whether line comment include trailing
+  newline. Doc comments come back empty? Compare comment `start_point`/`end_point`
+  against declaration `start_point`.
 
 ## Where the newer features came from
 
-Two prior-art projects were read before extending this skill. Nothing was
-copied; the ideas were reimplemented, and both are credited here:
+Prior art read before extending this skill. Nothing copied. Ideas reimplemented.
+Credit:
 
-- **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)** — a Rust
-  code-graph indexer. The idea of a language-agnostic cyclomatic-complexity pass
-  driven by a shared decision-point node set came from reading it. Note that the
-  repository ships no LICENSE file, so none of its source could be reused even
-  if that had been desirable.
-- **[graphify](https://github.com/Graphify-Labs/graphify)** (Apache-2.0) — a
-  Python knowledge-graph builder that also ships as an assistant skill. Three
-  ideas were adopted: per-result confidence labels, non-test and path-proximity
-  tie-breakers for ambiguous name resolution, and file-level import-cycle
-  detection.
+- **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)** — Rust
+  code-graph indexer. Source of the language-agnostic cyclomatic-complexity pass
+  driven by shared decision-point node set. Repo ships no LICENSE file, so none
+  of its source could be reused even if wanted.
+- **[graphify](https://github.com/Graphify-Labs/graphify)** (Apache-2.0) — Python
+  knowledge-graph builder, also shipped as assistant skill. Three ideas adopted:
+  per-result confidence labels, non-test and path-proximity tie-breakers for
+  ambiguous name resolution, file-level import-cycle detection.
 
-Both projects build a persistent graph database. This skill deliberately does
-not: it stays a stateless query tool so there is no index to build, invalidate,
-or keep in sync with edits. Where they trade setup cost for richer traversal,
-this trades traversal depth for zero setup.
+Both build persistent graph database. This skill deliberately not: stateless
+query tool, no index to build, invalidate, or sync with edits. They trade setup
+cost for richer traversal. This trades traversal depth for zero setup.
 
-A sibling skill, **`trace-codebase-flow`**, solves the same problem with a
-different shape: one flat record index (symbols, calls, callbacks, control flow,
-channels, boundaries) with `search` and `trace` over it. Reading it produced the
-`trace` and `effects` commands here, the refusal to resolve interface dispatch,
-credential and header-based generated-code exclusion, the multi-block
-single-file-component fix, and the parse-error warning with its Nix
-trailing-comma exception. Its command shape was not adopted — this skill keeps
-one command per question, and attaches doc comments, which the record model
-drops — but its blind-spot analysis was, and is written up in
-[tracing.md](tracing.md).
+Sibling skill **`trace-codebase-flow`** solve same problem, different shape: one
+flat record index (symbols, calls, callbacks, control flow, channels, boundaries)
+with `search` and `trace` over it. Reading it produced `trace` and `effects` here,
+refusal to resolve interface dispatch, credential and header-based generated-code
+exclusion, multi-block single-file-component fix, parse-error warning with its Nix
+trailing-comma exception. Command shape not adopted: this skill keep one command
+per question and attach doc comments, which record model drop. Blind-spot analysis
+adopted, written up in [tracing.md](tracing.md).
