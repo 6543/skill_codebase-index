@@ -1,0 +1,23 @@
+{
+  "skill_name": "codebase-index",
+  "evals": [
+    {
+      "id": 1,
+      "name": "orient-in-unknown-polyglot-repo",
+      "prompt": "I just cloned this repo and have never seen it before. Give me a map of what's in it and tell me which files I should read first to understand its architecture.",
+      "expected_output": "Language/size breakdown, densest files identified, and an outline of the top 1-2 files with reasoning about why they matter."
+    },
+    {
+      "id": 2,
+      "name": "trace-interface-and-implementors",
+      "prompt": "What does the Queue interface require, who implements it, and what extra behaviour does the implementation have beyond the interface?",
+      "expected_output": "Interface members with doc comments, implementor identified via method set, extra methods listed, and the name-only limitation stated."
+    },
+    {
+      "id": 3,
+      "name": "cross-language-frontend-lookup",
+      "prompt": "This project has a Vue frontend. Show me what's inside one of the Vue components and confirm the line numbers match the real file.",
+      "expected_output": "Script-block contents outlined with correct offset line numbers, verified against the source."
+    }
+  ]
+}
