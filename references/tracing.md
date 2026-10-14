@@ -31,10 +31,12 @@ Stop at first pass that answer the question. Most never reach pass three.
 
 | Label | Basis | Safe to state as |
 |---|---|---|
-| `EXTRACTED` | callee declared in the same file | fact |
-| `INFERRED` | one candidate survived ranking | "appears to call", worth one check |
+| `EXTRACTED` | callee declared in the same file, call bare or on `this`/`self` | fact |
+| `INFERRED` | one candidate survived ranking, in another file | "appears to call", worth one check |
+| `reference` | names a table, attribute, custom property or link without calling it | "refers to", never "calls" |
 | `AMBIGUOUS` | several survived (`refs` only) | a list, never a conclusion |
 | `dispatch` | the name is an interface member | "one of these implementations" |
+| `dynamic` | shell command name built at runtime (`$cmd`, `_item_$x`) | "calls something chosen at runtime"; read the code |
 | absent | nothing matched | unknown, not "nothing calls it" |
 
 Last row is the one that misleads. Empty `refs`, or leaf node in `trace`, means

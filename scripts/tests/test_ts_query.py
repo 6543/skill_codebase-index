@@ -42,13 +42,13 @@ class Case(unittest.TestCase):
         return path
 
     def run_cmd(self, command, *args, **flags):
-        handler, arity = ts_query.COMMANDS[command]
+        _, arity = ts_query.COMMANDS[command]
         opts = ts_query.default_opts(**flags)
         positional = list(args)
         while len(positional) < arity:
             positional.append(self.root)
         lines = []
-        handler(*positional[:arity], opts, lines.append)
+        ts_query.run_command(command, positional[:arity], opts, lines.append)
         return "\n".join(str(line) for line in lines)
 
 
@@ -59,13 +59,24 @@ class Case(unittest.TestCase):
 
 class RegistryTest(unittest.TestCase):
     def test_every_spec_names_a_loadable_grammar(self):
-        """A typo in a LangSpec's module or entry point silently skips the language."""
+        """A typo in a LangSpec's module or entry point silently skips the language.
+
+        Checked for every language whose grammar distribution is installed; the
+        others (outside the bundled profile, say) are skipped, not passed.
+        """
+        from importlib.metadata import PackageNotFoundError, distribution
+
+        import runtime_manifest
+
+        skill = os.path.dirname(SCRIPTS)
+        pins = runtime_manifest.load_manifest(skill)["languages"]
         for spec in ALL:
             with self.subTest(language=spec.key):
-                self.assertIsNotNone(
-                    ts_query.get_parser(spec),
-                    f"{spec.key}: install {spec.module} to run this test",
-                )
+                try:
+                    distribution(pins[spec.key]["distribution"])
+                except PackageNotFoundError:
+                    self.skipTest(f"{pins[spec.key]['distribution']} not installed")
+                self.assertIsNotNone(ts_query.get_parser(spec), spec.module)
 
     def test_no_extension_is_claimed_by_two_languages(self):
         seen = {}
@@ -624,6 +635,100 @@ class NixTest(Case):
         path = self.write("broken.go", "package app\nfunc Broken( {\n")
         self.run_cmd("outline", path)
         self.assertIn(path, ts_query._PARSE_ERRORS)
+
+
+# --------------------------------------------------------------------------
+# Go: syntax newer than the grammar
+# --------------------------------------------------------------------------
+
+
+class GoNewExprTest(Case):
+    """Go 1.26 lets `new` take an expression; tree_sitter_go 0.25 only takes a type.
+
+    First seen on woodpecker's pipeline/backend/docker/docker.go, where
+    `Timeout: new(int(e.config.stopTimeout))` marked the whole file as partial.
+    """
+
+    BODY = """
+        package app
+
+        type Box struct{ N *int }
+
+        func seed() int { return 1 }
+
+        // Stop mirrors the woodpecker call: new(<conversion>) inside a
+        // composite literal that is itself an argument in an if header.
+        func Stop(timeout int64) error {
+        \tif _, err := run(Box{
+        \t\tN: new(int(timeout)),
+        \t}); err != nil {
+        \t\treturn err
+        \t}
+        \treturn nil
+        }
+
+        func Mixed() {
+        \t_ = new(seed())
+        \t_ = new(42)
+        \t_ = new("s")
+        \t_ = new(-seed())
+        \t_ = new(Box{N: nil})
+        \t_ = new([]int)
+        \t_ = new(map[string]int)
+        \t_ = new(Box)
+        \t_ = make([]int, 3)
+        }
+        """
+
+    def test_new_with_an_expression_operand_is_not_a_parse_error(self):
+        path = self.write("app.go", self.BODY)
+        self.run_cmd("outline", path)
+        self.assertEqual(set(), ts_query._PARSE_ERRORS)
+
+    def test_calls_inside_new_are_still_found(self):
+        """The point of repairing the parse: the operand is real code."""
+        self.write("app.go", self.BODY)
+        refs = self.run_cmd("refs", "seed")
+        self.assertIn("app.go:19: seed(", refs)
+        self.assertIn("app.go:22: seed(", refs)
+
+    def test_new_keeps_its_name_in_output(self):
+        """The workaround must not leak into what the reader sees."""
+        path = self.write("app.go", self.BODY)
+        refs = self.run_cmd("refs", "new")
+        self.assertEqual(9, refs.count(": new("), refs)
+        decl = self.run_cmd("decl", "Stop", path)
+        self.assertIn("N: new(int(timeout)),", decl)
+        outline = self.run_cmd("outline", path)
+        self.assertNotIn(ts_query._GO_NEW_MASK.decode("utf8"), refs + decl + outline)
+
+    def test_a_genuine_error_beside_new_is_still_reported(self):
+        path = self.write(
+            "broken.go",
+            "package app\nfunc A() { _ = new(1) }\nfunc Broken( {\n",
+        )
+        self.run_cmd("outline", path)
+        self.assertIn(path, ts_query._PARSE_ERRORS)
+
+
+class InstallHintTest(Case):
+    """Global pip is refused on PEP 668 Pythons and impossible on Nix."""
+
+    def test_hint_points_at_the_bootstrap_not_global_pip(self):
+        hint = ts_query.install_hint(["nix", "go"])
+        self.assertIn("bootstrap.py --languages go,nix", hint)
+        self.assertNotIn("--break-system-packages", hint)
+
+    def test_langs_prints_the_hint_for_a_missing_grammar(self):
+        real = ts_query.get_parser
+        ts_query.get_parser = lambda spec: None if spec.key == "go" else real(spec)
+        try:
+            lines = []
+            ts_query.cmd_langs(None, ts_query.default_opts(), lines.append)
+            out = "\n".join(lines)
+        finally:
+            ts_query.get_parser = real
+        self.assertIn("--languages go", out)
 
 
 # --------------------------------------------------------------------------

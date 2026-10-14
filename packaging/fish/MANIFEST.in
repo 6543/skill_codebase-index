@@ -1,0 +1,3 @@
+include LICENSE README.md SOURCE.json
+include src/parser.c src/scanner.c src/node-types.json src/tree_sitter/parser.h
+include tree_sitter_fish/binding.c tree_sitter_fish/*.pyi tree_sitter_fish/py.typed

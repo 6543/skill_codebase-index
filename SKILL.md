@@ -1,6 +1,6 @@
 ---
-name: codebase-index
-description: Structural code search, call-graph tracing and indexing using tree-sitter, covering Go, TypeScript, JavaScript, Vue, Svelte, Rust, Python, Java, Kotlin, Swift, Scala, C#, Ruby, PHP, C, C++, Lua, Zig, Julia, Nix, and Bash. Use this INSTEAD of grep to explore or understand an unfamiliar codebase: getting oriented in a new repo, following a code path in either direction, finding what implements an interface, listing a type's methods or fields, reading a declaration with its doc comment, auditing TODOs, spotting circular imports, finding async handoffs and serialization boundaries, or ranking functions by complexity. Trigger it on "how does X work in this repo", "where is Y handled", "what happens when Z runs", "what calls this", "map this codebase", "what implements Z", "show me the API surface", "trace the flow from A to B", or a request to plan a feature against existing code, even if tree-sitter is never mentioned. Grep matches lines; this matches declarations and the edges between them.
+name: "codebase-index"
+description: 'Structural code search, call-graph tracing and indexing with tree-sitter for Go, TypeScript, JavaScript, Vue, Svelte, Rust, Python, Java, Kotlin, Swift, Scala, C#, C, C++, Ruby, PHP, Lua, Zig, Julia, Nix, Bash, Fish, PowerShell, SQL, HTML and CSS, with an offline setup. Use this INSTEAD of grep to explore an unfamiliar codebase: getting oriented in a new repo, following a code path either way, finding what implements an interface, listing a type''s methods or fields, reading a declaration with its doc comment, auditing TODOs, import cycles, async handoffs, serialization boundaries, complexity. Trigger it on "how does X work in this repo", "where is Y handled", "what calls this", "map this codebase", "what implements Z", "trace the flow from A to B", "which tables does this touch", or planning a feature against existing code, even if tree-sitter is never mentioned. Grep matches lines; this matches declarations and the edges between them.'
 ---
 
 # Codebase Index
@@ -16,14 +16,33 @@ grep-then-read-with-context.
 
 ## Setup
 
-Need `tree_sitter` plus one grammar package per language. Check first:
+One command. Works offline: skill bundle pinned, hash-checked wheels for CPython
+3.12 and 3.13 on Linux x86_64 (glibc). Other platforms get same pinned versions
+from PyPI.
 
 ```bash
-python3 scripts/ts_query.py langs
+python3 scripts/bootstrap.py
 ```
 
-Missing grammar print exact `pip install` line. Missing not fatal: those files
-skipped, note to stderr. Install only languages repo contain. `map` tell which.
+Build isolated environment under user cache dir (never in skill, never in repo
+being read), probe every grammar by parsing real snippet, print one JSON report.
+Already set up: reused in about a second. After that, plain
+`python3 scripts/ts_query.py ...` switch into that environment by itself, so
+commands below work unchanged.
+
+Default profile `common` = Go, Rust, JavaScript, TypeScript, TSX, Vue, Nix,
+Python, Java, SQL, Bash, Fish, C, C#, C++, PowerShell, HTML, CSS. Kotlin, Swift,
+Scala, Ruby, PHP, Lua, Zig, Julia, Svelte: `--profile all` (needs PyPI). One
+language: `--languages go,nix` (aliases ok: `ts`, `c#`, `pwsh`). No network
+allowed: `--offline` (fail naming what bundle lack, never half-install). NixOS:
+`nix run path/to/skill -- map .`. Flags, report fields, recovery:
+[references/bootstrap.md](references/bootstrap.md).
+
+Do not `pip install` grammars into global Python. PEP 668 systems refuse, Nix
+cannot, and unpinned grammar is how parser ABI mismatch get in.
+
+Check what is installed: `python3 scripts/ts_query.py langs`. Missing grammar not
+fatal: those files skipped, note to stderr.
 
 ## Workflow for unfamiliar repo
 
@@ -55,6 +74,8 @@ python3 scripts/ts_query.py outline path/to/file.go
 | What this type own? | `methods <Type> <root>` |
 | What data this hold, with tags? | `fields <Type> <root>` |
 | What enum values / constants? | `consts <root>` |
+| Which tables does this SQL read? | `trace <view-or-function> <root>` |
+| What links here / what does page load? | `refs <file-or-#id> <root>`, `outline page.html` |
 | What authors flag unfinished? | `todos <root>` |
 | What satisfy this interface? | `impls <Iface> <root>` |
 | What happen when this run, several hops out? | `trace <Name> <root>` |
@@ -64,6 +85,10 @@ python3 scripts/ts_query.py outline path/to/file.go
 | Circular imports? | `cycles <root>` |
 
 `<root>` = file or directory. Directories walked recursively.
+
+Question with no meaning for a language (interfaces in CSS, goroutines in SQL)
+answer `not applicable`, never empty "nothing found". Mixed directory: command
+run on languages it fit, skipped ones named at end.
 
 **4. One hop not enough → trace.** `refs` answer "who call this". `trace` follow
 answer onward, print tree:
@@ -111,8 +136,9 @@ before concluding anything from trace of async code.
   handler passed to router. None have textual signature worth grepping. Each one
   is place where confident-looking trace quietly stop being true.
 
-Test files, generated mocks, files with machine-written header: excluded by
-default. They dominate results, rarely answer question. Add `--tests` or
+Test files (`*_test.go`, `test_*.py`, `*.test.ts`, `*.spec.*`, `*.Tests.ps1`,
+`FooTest.java`, `FooTests.cs`), generated mocks, files with machine-written
+header: excluded by default. They dominate results, rarely answer question. Add `--tests` or
 `--mocks` when wanted. Credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`,
 `credentials.json`) never read at all. Files over 2 MB skipped as data, not source.
 
@@ -123,19 +149,27 @@ every edge with how much the answer can be trusted:
 
 | Label | Meaning |
 |---|---|
-| `EXTRACTED` | the callee is declared in this same file; safe to rely on |
-| `INFERRED` | exactly one plausible declaration survived ranking |
+| `EXTRACTED` | the callee is declared in this same file, and the call is bare or on `this`/`self` (or the Go receiver); safe to rely on |
+| `INFERRED` | exactly one plausible declaration survived ranking, in another file |
 | `AMBIGUOUS` | several remain; `refs` shows its best guess with a count of the rest |
 
+`refs` also labels a hit `reference` when it names something without calling it:
+a SQL table read, a Nix attribute select, a CSS `var()`, an HTML link. A trigger's
+`EXECUTE FUNCTION f()` counts as a call.
+
 `trace` is stricter than `refs`: where several candidates survive, it draws no
-edge at all and lists the call under `unresolved` with every candidate. A call
+edge at all and lists the call under `unresolved` with every candidate. A shell
+command whose name is built at runtime (`"$handler"`, `_item_$x`, `& $cmd`) is
+listed there as `dynamic`. A call
 naming an interface member is separated out as `dispatch`, because that is not an
-ambiguity to be broken by better ranking — the target is chosen at runtime and is
+ambiguity to be broken by better ranking: the target is chosen at runtime and is
 not written down anywhere in the file.
 
-Ranking uses two positional signals, not type information: production code is
-assumed not to call test fixtures, and a nearer declaration in the directory tree
-beats a distant one. A qualified call such as `p.q.Poll` inside a method also
+Ranking uses positional signals, not type information: production code is
+assumed not to call test fixtures, a nearer declaration in the directory tree
+beats a distant one, and a same-file declaration wins only for a bare call or a
+call on `this`/`self`. `view.render()` names some other object, so a `render` in
+the same file is no evidence for it and the call stays `AMBIGUOUS`. A qualified call such as `p.q.Poll` inside a method also
 named `Poll` excludes that enclosing method, since it is dispatching on a
 different receiver. A qualified call whose head names an imported package that
 resolves outside the repo (`rand.New`) is dropped rather than matched against a
@@ -149,7 +183,7 @@ is worse than no result.
 ```
 --tests          include test files
 --mocks          include generated mocks and header-marked generated code
---lang=<key>     restrict to one language (see `langs`)
+--lang=<key>     restrict to one language (see `langs`; aliases like ts, c#, pwsh)
 --json           machine-readable output, for piping into further analysis
 --no-gitignore   index everything, ignoring the repo's .gitignore
 --min=<n>        complexity: only report functions scoring at or above n
@@ -158,7 +192,11 @@ is worse than no result.
 --callers        trace: follow inbound edges; --both for either direction
 --kind=<k>       effects: spawn, channel, boundary or callback
 --max-bytes=<n>  skip files larger than n bytes (default 2000000)
+--               end of options: `decl -- --json` for a name that looks like a flag
 ```
+
+Names starting with `--` that are not flags (CSS `--brand`) are names, no `--`
+needed. Extensionless scripts recognised by shebang (`#!/usr/bin/env fish`).
 
 `.gitignore` honoured by default: negation rules, per-directory files. Generated
 and vendored code stay out with no hardcoded exclusion list. Lockfiles always
@@ -186,7 +224,7 @@ Syntactic analysis, not semantic. It does not resolve types, so:
 - `trace` is built from those same edges, so its reach is bounded by them. A
   reflected call, a call through a generated client, a handler resolved from a
   string route table, and an interface with several implementors all end the
-  chain. They end it *visibly*, in the `unresolved` block, rather than silently —
+  chain. They end it *visibly*, in the `unresolved` block, rather than silently;
   but an empty `unresolved` block is not proof that nothing was missed.
 - `effects` detects channels in Go only, and reports a callback whenever an
   argument names a function declared in this repo, so a local variable that
@@ -202,11 +240,31 @@ Syntactic analysis, not semantic. It does not resolve types, so:
   long flat switch scores high and is easy to read.
 - Single-file components (`.vue`, `.svelte`) are parsed by extracting every
   `<script>` block and parsing each as TypeScript. Line numbers are offset back to
-  the real file, but template markup is not analysed — so a handler bound only in
-  the template has no visible caller.
+  the real file, but template markup is not analysed (`outline` says so), so a
+  handler bound only in the template has no visible caller.
+- HTML pages are outlined as documents (title, landmarks, ids, headings, links,
+  scripts). Inline `<script>` and `<style>` are parsed as JavaScript/TypeScript and
+  CSS at their real line numbers. Template syntax (Jinja, EJS) is not HTML and
+  marks the file partial.
+- SQL is parsed one statement at a time, so a statement in a dialect the grammar
+  does not know (T-SQL procedures, Oracle PL/SQL, Postgres `PARTITION OF`) costs
+  only itself. PostgreSQL and MySQL parse best. A table reference is syntax, not
+  proof the statement runs.
+- C and C++ are parsed without the preprocessor. Macro-heavy code
+  (`FMT_BEGIN_NAMESPACE`, X-macros) parses partially; declarations around the
+  macro are usually still found.
+- PowerShell's grammar rejects some common forms (`$x = {}`, `Get-Module A, B`,
+  `param (`), present at upstream HEAD too. Error recovery still finds about 96%
+  of functions. Names match case-insensitively, as PowerShell does.
 - Kotlin's grammar represents interfaces as `class_declaration`, so `outline` does
   not label them separately. Dart and Elixir are not supported: their grammars do
   not expose declaration names in a usable form.
+- Go's grammar (`tree_sitter_go` 0.25.0, newest release) predates Go 1.26
+  `new(expr)`. A Go file that fails to parse is parsed again with the rejected
+  `new` calls read as ordinary calls, so `new(int(x))` no longer marks the file
+  partial and calls inside the operand are found. Any other syntax newer than the
+  grammar still lands in the stderr `parse errors` note: locate it with
+  `debug-ast`, look for the `ERROR` node.
 - Nix has no functions, classes or interfaces in the C sense, so `iface`,
   `methods`, `fields` and `impls` do not apply. `outline`, `decl`, `refs`,
   `trace`, `consts`, `todos`, `complexity` and `cycles` all work, and for Nix
@@ -239,6 +297,8 @@ without over-claiming: `references/tracing.md`.
 
 `python3 -m unittest discover -s scripts/tests -t scripts` build throwaway repos,
 assert behaviours this document promise: receiver disambiguation, confidence
-labels, refusal to resolve interface dispatch, credential exclusion, Nix and
-single-file-component quirks. Run after changing a `LangSpec`. Wrong node type
-usually produce plausible output, not error.
+labels, refusal to resolve interface dispatch, credential exclusion, Nix,
+single-file-component, SQL, HTML/CSS quirks, and an offline bootstrap from the
+bundle. Run with bootstrapped python. Run after changing a `LangSpec`. Wrong node
+type usually produce plausible output, not error. `nix flake check` run same suite
+plus a probe of every bundled grammar.

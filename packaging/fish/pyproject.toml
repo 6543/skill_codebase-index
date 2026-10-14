@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distinct name: no upstream Python distribution exists. The import name is the
+# conventional one, so codebase-index loads it like every other grammar.
+name = "codebase-index-tree-sitter-fish"
+# Local label carries the pinned upstream revision (see SOURCE.json).
+version = "0.1.0+gb7f1d682"
+description = "Fish grammar for tree-sitter, Python binding (codebase-index local wrapper)"
+readme = "README.md"
+license = "Unlicense"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+classifiers = ["Topic :: Software Development :: Compilers", "Typing :: Typed"]
+
+[project.urls]
+Grammar = "https://github.com/ram02z/tree-sitter-fish"
+
+[project.optional-dependencies]
+core = ["tree-sitter~=0.25"]
+
+[tool.setuptools]
+packages = ["tree_sitter_fish"]
+
+[tool.setuptools.package-data]
+tree_sitter_fish = ["*.pyi", "py.typed"]

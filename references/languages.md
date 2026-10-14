@@ -7,6 +7,8 @@ first.
 ## Contents
 
 - [Coverage table](#coverage-table)
+- [Commands that do not apply](#commands-that-do-not-apply)
+- [Real-world validation](#real-world-validation)
 - [Per-language notes](#per-language-notes)
 - [Concepts and how they map](#concepts-and-how-they-map)
 - [Adding a language](#adding-a-language)
@@ -29,14 +31,51 @@ first.
 | C# | `.cs` | `tree_sitter_c_sharp` | yes | `///` | properties reported as fields |
 | Ruby | `.rb .rake` | `tree_sitter_ruby` | n/a | `#` | modules and classes both appear as types |
 | PHP | `.php` | `tree_sitter_php` | yes | `/** */` | traits treated as types |
-| C++ | `.cc .cpp .cxx .hpp .hh .hxx` | `tree_sitter_cpp` | n/a | `//`, `/** */` | name and params live in the declarator chain |
-| C | `.c .h` | `tree_sitter_c` | n/a | same | `#define` reported as a constant |
-| Bash | `.sh .bash` | `tree_sitter_bash` | n/a | `#` | functions and variable assignments only |
+| C++ | `.cc .cpp .cxx .hpp .hh .hxx`, C++ `.h` | `tree_sitter_cpp` | n/a | `//`, `/** */` | name and params live in the declarator chain |
+| C | `.c .h` | `tree_sitter_c` | n/a | same | `#define` as constant; prototypes listed apart |
+| Bash | `.sh .bash`, shebang | `tree_sitter_bash` | n/a | `#` | functions, assignments, `source`/`.` as imports |
+| Fish | `.fish`, shebang | `tree_sitter_fish` (local, `packaging/fish`) | n/a | `#`, `--description` | functions, global `set`, `source` as imports |
+| PowerShell | `.ps1 .psm1 .psd1`, shebang | `tree_sitter_powershell` | n/a | `#`, `<# #>` help | functions, filters, classes, enums; case-insensitive names |
+| SQL | `.sql` | `tree_sitter_sql` | n/a | `--` | tables, views, types as types; functions, triggers as defs; parsed per statement |
+| HTML | `.html .htm` | `tree_sitter_html` | n/a | `<!-- -->` | document outline; inline script/style parsed with their grammars |
+| CSS | `.css` | `tree_sitter_css` | n/a | `/* */` | rules, custom properties, keyframes, `@import` |
 | Scala | `.scala .sc` | `tree_sitter_scala` | traits | `//`, `/** */` | objects, traits, case classes |
 | Lua | `.lua` | `tree_sitter_lua` | n/a | `--` | functions and locals; `M.run` keeps its table prefix |
 | Zig | `.zig` | `tree_sitter_zig` | n/a | `///` | struct name read from the enclosing `const` binding |
 | Julia | `.jl` | `tree_sitter_julia` | n/a | `#` | name nested under `type_head` / `signature` |
 | Nix | `.nix` | `tree_sitter_nix` | n/a | `#` | bindings are the only declaration form; see below |
+
+## Commands that do not apply
+
+These answer `not applicable to <lang>: <reason>` (JSON: `{"not_applicable": ...}`)
+instead of an empty result, which would read as a search that found nothing:
+
+| Language | Not applicable |
+|---|---|
+| Bash, Fish | `iface`, `impls`, `methods`, `fields` |
+| Nix | `iface`, `impls`, `methods`, `fields` |
+| PowerShell | `iface`, `impls` |
+| SQL | `iface`, `impls`, `methods`, `effects`, `complexity`, `cycles` |
+| HTML | everything but `map`, `outline`, `decl`, `refs`, `todos`, `debug-ast` (inline scripts still answer code questions) |
+| CSS | `iface`, `impls`, `methods`, `consts`, `effects`, `complexity` |
+
+## Real-world validation
+
+Every adapter was run against a shallow clone of a real project (2026-10-14):
+every command, text and JSON, 603 runs, none failed. Parse errors per region:
+
+| Language | Project | Regions with errors | Cause |
+|---|---|---|---|
+| Go, Rust, Java, C#, Python, Nix, Fish, TSX, Vue | woodpecker, ripgrep, gson, MediatR, flask, disko, tide, swr | 0% | |
+| Bash | nvm, ripgrep | 0.3% | nested brace expansion in a completion script |
+| JavaScript, TypeScript | express, swr | 0.7%, 1.9% | Jinja inside inline scripts; one generic overload form |
+| CSS | css-examples, woodpecker | 1.3% | `url(../x)` unquoted in `shape-outside`, range media queries |
+| HTML | css-examples, express, flask | 7% | `</textarea\n>`, EJS and Jinja templates |
+| PowerShell | Pester | 21% | grammar gaps, see below; 96% of functions still found |
+| SQL | sakila (8 dialects) | 29% of statements | dialect features; every table found except Postgres `PARTITION OF` partitions and one T-SQL table |
+| C, C++ | jq, fmt | 46%, 52% | macros (no preprocessor); 98% of jq functions found |
+
+A partial file is always listed in the stderr `parse errors` note.
 
 ### Nix
 
@@ -86,6 +125,15 @@ files" when tests sit behind build tag.
 Interface methods are `method_elem`, not `method_declaration`, so registered as
 defs to make `iface` work.
 
+Go 1.26 `new(expr)` (`new(int(x))`, `new(42)`, `new(f())`): `tree_sitter_go`
+0.25.0 and upstream master hardcode `new(` Type `)` and flag the rest as `ERROR`.
+`_reparse_go_new` in `ts_query.py` parse failing Go file second time with rejected
+`new` identifiers swapped for same-length stand-in, so they read as plain calls.
+Offsets and lines unchanged, `text()` swap name back. Calls grammar accepted
+(`new([]int)`, `new(T)`) keep builtin form. Retry kept only if it lower error
+count, so genuine error still reported. Drop workaround once grammar release
+accept expression operand: `GoNewExprTest` then pass without it.
+
 ### Rust
 
 `impl Type` and `impl Trait for Type` blocks are containers. Their functions
@@ -98,12 +146,86 @@ adding grammar with third convention.
 
 ### Python
 
+`from .x import y`, `from . import util` and `from ..a.b import c` resolve to
+files in the repo (packages through `__init__.py`), so calls through those names
+are followed and import cycles are found. Only names bound by an import that
+resolves outside the repo count as external.
+
 No separate constant declaration exists. Module-level assignments reported as
 constants, class-level as fields. Assignments inside method bodies (`self.x = y`)
 excluded on purpose: they belong to method scope, not class surface.
 
 Docstrings read from first string expression in body, not from preceding
 comments.
+
+### SQL
+
+Grammar: DerekStride/tree-sitter-sql. Covers PostgreSQL and MySQL best, ANSI
+SQL mostly, other dialects partly. Its recovery is poor at statement level: one
+statement it does not know could swallow a thousand following lines into one
+`ERROR`. So files are split into statements (`;`, MySQL `DELIMITER`, Oracle `/`,
+T-SQL `GO` lines; quotes, comments and `$tag$` bodies respected) and each is
+parsed on its own, with its real line offset. On sakila this took table recall
+from 1/16 to 16/16 for DB2 and Oracle, 2/16 to 15/16 for SQL Server.
+
+- Types: `CREATE TABLE/VIEW/MATERIALIZED VIEW/TYPE`. Columns are fields. Defs:
+  `CREATE FUNCTION/TRIGGER`. Constants: indexes, sequences, schemas.
+- Names: `decl orders` and `decl app.orders` both work; quoted identifiers match
+  unquoted (`"Audit Log"`).
+- `refs` reports table reads and writes as `reference`, function invocations as
+  calls, and a trigger's `EXECUTE FUNCTION f()` as a call. The declaration itself
+  is not a reference.
+- `trace` from a view or function reaches the tables it reads. PL/pgSQL bodies
+  (`DECLARE`, `IF ... THEN`, loops, `RETURN`, `:=`) are not SQL; when a body fails,
+  that control syntax is blanked for a second parse, so queries inside `IF` blocks
+  are found. `PERFORM f()` counts as a call. `decl` still prints the body as written.
+- A file that parses whole stays one parse; only a failing file is split into
+  statements, so 8 MB dumps outline in seconds.
+- Not parsed: T-SQL `CREATE PROCEDURE`, Oracle PL/SQL blocks, Postgres
+  `PARTITION OF`, SQLite `AUTOINCREMENT` triggers, psql meta-commands
+  (`\restrict`). Each costs only its own statement. Dynamic SQL is invisible.
+
+### PowerShell
+
+Grammar: airbus-cert/tree-sitter-powershell 0.26.4. Functions and filters
+(`function_statement`), classes with properties and methods, enums. `<# .SYNOPSIS
+#>` help above a function is its doc comment. Calls are commands
+(`Get-Thing -Name x`) and member invocations (`$this.Run()`, `[T]::new()`), matched
+case-insensitively. Imports: `using module`, `Import-Module`, dot-sourcing (`. ./x.ps1`);
+`& ./x.ps1` runs a script and is not an import. `.psd1` manifests list their
+top-level keys as constants. `Start-Job`, `Start-ThreadJob` are spawns,
+`ConvertTo-Json` and friends are boundaries.
+
+Grammar gaps, still at upstream HEAD (2026-07): empty script blocks (`$x = {}`),
+comma lists as command arguments (`Get-Module A, B`), `param (` with a space,
+`$PSScriptRoot/path` arguments. Error recovery keeps most declarations.
+
+### Fish
+
+Not Bash: parsed with ram02z/tree-sitter-fish, packaged locally because no Python
+distribution exists. `function name -d 'text'` contributes its description as
+doc. Event handlers (`--on-event`) show in the signature line; the event wiring
+itself leaves no call edge. A call whose name is computed (`_item_$name`) is
+listed by `trace` under `unresolved` as a runtime name, not dropped. Global `set` is a constant, `set -l` inside a function
+is not. `source`/`.` are imports and take part in `cycles`. Calls inside command
+substitutions, pipes and `and`/`or` chains are found. Dynamic names
+(`function $name`, `eval`) are listed as written and resolve nothing.
+
+### HTML and CSS
+
+HTML `outline`: title, landmarks and elements with an `id` (nested), headings,
+links and resources (`<link>` kind from its `rel`), and inline code blocks, which
+are then outlined with the JavaScript/TypeScript or CSS grammar. `decl top-nav`
+finds `<nav id="top-nav">`. `refs settings` finds `href="#settings"` and
+`<label for=settings>`. `refs site.css` finds every page linking it.
+
+CSS `outline`: imports, custom properties (with the rule they sit in), rules
+(with their `@media`/`@layer` context), at-rules. `decl .card` finds a rule even
+inside a selector list. `fields .card` lists its declarations. `refs --brand`
+finds `var(--brand)`; `refs fade-in` finds `animation: fade-in`. Tailwind v4
+statement at-rules (`@plugin "x";`, `@reference`, `@custom-variant`) are not in the
+grammar; on error their arguments are blanked and the file parsed again, so they
+no longer corrupt the following rule.
 
 ### Vue and Svelte
 
@@ -117,8 +239,9 @@ pair instance script with `context="module"`. Reading only first match silently
 dropped whichever came second. `outline` label each block when file have more
 than one.
 
-Template markup and styles not analysed. Handler bound only in template have no
-visible caller: commonest way a `refs` or `trace` result on a component mislead.
+Template markup and styles not analysed; `outline` says so. Handler bound only in
+template have no visible caller: commonest way a `refs` or `trace` result on a
+component mislead.
 
 ### JavaScript and TypeScript
 
@@ -132,8 +255,20 @@ print in full: enum-style groups usually the reason someone look.
 ### C and C++
 
 Function name and parameter list nest inside declarator chain, not exposed as
-fields. That is what `name_hook="c_declarator"` handle. Preprocessor macros
-reported as constants. No expansion attempted.
+fields. That is what `name_hook="c_declarator"` handle: it follows pointer and
+parenthesized declarators and takes the `name` of a qualified one, so
+`void app::run()` is `run` and `int (*pick(void))(int)` is `pick(void)`. Return
+types keep qualifiers and pointers (`-> const char *`).
+
+- `struct node *next` names a struct with the same node type that defines one;
+  only a specifier with a body is listed as a type. An anonymous struct under a
+  `typedef` is shown as the typedef, with its fields.
+- Prototypes (`void f(int);`) are listed under `prototypes`, apart from variables.
+- `.h` is C++ when it uses something C cannot (`namespace`, `template<`, `class`
+  with a body, access specifiers, `<iostream>`-style includes), else C.
+- Preprocessor macros reported as constants. No expansion attempted, so macro
+  wrappers (`FMT_BEGIN_NAMESPACE`) leave partial parses; a garbled signature is cut
+  to one line.
 
 ### Kotlin
 
@@ -179,7 +314,11 @@ against spec's `ifaces`.
 
 ## Adding a language
 
-1. Install grammar: `pip install tree_sitter_<lang>`.
+1. Pin grammar in `vendor/inventory.json` (`grammars`, `profiles.all`), add a
+   fixture to `FIXTURES` in `scripts/runtime_probe.py`, then
+   `python3 scripts/bootstrap.py --languages <key> --force`. Bundling it too means
+   adding it to `profiles.common` and running `scripts/build_wheelhouse.py`
+   (see [bootstrap.md](bootstrap.md)).
 2. Write small sample exercising class, interface, function, constant, field, doc
    comment.
 3. Dump tree: `python3 scripts/ts_query.py debug-ast sample.ext --depth=3`. Print
@@ -187,6 +326,10 @@ against spec's `ifaces`.
 4. Add `LangSpec` mapping each concept to node types observed.
 5. Re-run `outline` on sample. Confirm every element appear once, right section,
    with doc comment.
+6. Run it on a real project in that language: shallow clone, `map`, `outline` the
+   densest file, `refs` and `trace` a function called from several files. Toy
+   samples hide grammar gaps and error-recovery behaviour.
+7. Set `unsupported` for commands with no meaning in the language.
 
 Two failure modes worth explicit check. Both produce plausible-looking wrong
 output:
@@ -203,11 +346,11 @@ output:
 Prior art read before extending this skill. Nothing copied. Ideas reimplemented.
 Credit:
 
-- **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)** — Rust
+- **[codegraph-rust](https://github.com/Jakedismo/codegraph-rust)**: Rust
   code-graph indexer. Source of the language-agnostic cyclomatic-complexity pass
   driven by shared decision-point node set. Repo ships no LICENSE file, so none
   of its source could be reused even if wanted.
-- **[graphify](https://github.com/Graphify-Labs/graphify)** (Apache-2.0) — Python
+- **[graphify](https://github.com/Graphify-Labs/graphify)** (Apache-2.0): Python
   knowledge-graph builder, also shipped as assistant skill. Three ideas adopted:
   per-result confidence labels, non-test and path-proximity tie-breakers for
   ambiguous name resolution, file-level import-cycle detection.

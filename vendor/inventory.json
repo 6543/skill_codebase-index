@@ -1,0 +1,56 @@
+{
+  "_comment": "Reviewed source of truth. build_wheelhouse.py generates vendor/wheels.json, requirements/ and vendor/licenses/ from it; bootstrap.py reads only the generated files. Change a pin here, then rebuild.",
+  "runtime": {
+    "distribution": "tree-sitter",
+    "version": "0.25.2",
+    "module": "tree_sitter",
+    "_note": "0.26.0 crashed in a direct parser diagnostic on Linux CPython 3.12 (see references/bootstrap.md); stay on 0.25.2 until that is reproduced and ruled out."
+  },
+  "grammars": {
+    "tree-sitter-bash": {"version": "0.25.1", "languages": ["bash"]},
+    "tree-sitter-c": {"version": "0.24.2", "languages": ["c"]},
+    "tree-sitter-c-sharp": {"version": "0.23.5", "languages": ["c_sharp"]},
+    "tree-sitter-cpp": {"version": "0.23.4", "languages": ["cpp"]},
+    "tree-sitter-css": {"version": "0.25.0", "languages": ["css"]},
+    "tree-sitter-go": {"version": "0.25.0", "languages": ["go"]},
+    "tree-sitter-html": {"version": "0.23.2", "languages": ["html"]},
+    "tree-sitter-java": {"version": "0.23.5", "languages": ["java"]},
+    "tree-sitter-javascript": {"version": "0.25.0", "languages": ["javascript"]},
+    "tree-sitter-nix": {"version": "0.1.0", "languages": ["nix"]},
+    "tree-sitter-powershell": {"version": "0.26.4", "languages": ["powershell"]},
+    "tree-sitter-python": {"version": "0.25.0", "languages": ["python"]},
+    "tree-sitter-rust": {"version": "0.24.2", "languages": ["rust"]},
+    "tree-sitter-sql": {"version": "0.3.11", "languages": ["sql"]},
+    "tree-sitter-typescript": {"version": "0.23.2", "languages": ["typescript", "tsx", "vue", "svelte"]},
+    "codebase-index-tree-sitter-fish": {
+      "version": "0.1.0+gb7f1d682",
+      "languages": ["fish"],
+      "local": "packaging/fish",
+      "_note": "No upstream Python distribution exists; built from the pinned grammar sources in packaging/fish."
+    },
+    "tree-sitter-julia": {"version": "0.23.1", "languages": ["julia"]},
+    "tree-sitter-kotlin": {"version": "1.1.0", "languages": ["kotlin"]},
+    "tree-sitter-lua": {"version": "0.5.0", "languages": ["lua"]},
+    "tree-sitter-php": {"version": "0.25.1", "languages": ["php"]},
+    "tree-sitter-ruby": {"version": "0.23.1", "languages": ["ruby"]},
+    "tree-sitter-scala": {"version": "0.26.2", "languages": ["scala"]},
+    "tree-sitter-swift": {"version": "0.7.4", "languages": ["swift"]},
+    "tree-sitter-zig": {"version": "1.1.2", "languages": ["zig"]}
+  },
+  "profiles": {
+    "common": [
+      "go", "rust", "javascript", "typescript", "tsx", "vue", "nix", "python", "java",
+      "sql", "bash", "fish", "c", "c_sharp", "cpp", "powershell", "html", "css"
+    ],
+    "all": [
+      "go", "rust", "javascript", "typescript", "tsx", "vue", "svelte", "nix", "python",
+      "java", "sql", "bash", "fish", "c", "c_sharp", "cpp", "powershell", "html", "css",
+      "julia", "kotlin", "lua", "php", "ruby", "scala", "swift", "zig"
+    ]
+  },
+  "bundled_profile": "common",
+  "targets": {
+    "cp312-manylinux_x86_64": {"python": "3.12", "abi": "cp312", "platform": "manylinux2014_x86_64", "machine": "x86_64", "min_glibc": "2.17"},
+    "cp313-manylinux_x86_64": {"python": "3.13", "abi": "cp313", "platform": "manylinux2014_x86_64", "machine": "x86_64", "min_glibc": "2.17"}
+  }
+}

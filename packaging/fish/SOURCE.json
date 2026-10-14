@@ -1,0 +1,14 @@
+{
+  "upstream": "https://github.com/ram02z/tree-sitter-fish",
+  "revision": "b7f1d682941e0c62dfcd6bf9ef481638351bab16",
+  "revision_date": "2026-08-24",
+  "license": "Unlicense",
+  "language_abi": 14,
+  "files": {
+    "LICENSE": "6b0382b16279f26ff69014300541967a356a666eb0b91b422f6862f6b7dad17e",
+    "src/parser.c": "c08e354154e77943264cc308071b1b00575b23e9c1a460a23020d724fec89429",
+    "src/scanner.c": "7c245427bde26e8d4fe42fe69d96bd42b20608ee6fd7d47c2a51877e19a29645",
+    "src/node-types.json": "f1b14abcc7bcde8431119325751bc93dd4caceb4a33940389e5f2c8849641b22",
+    "src/tree_sitter/parser.h": "ab104936984904469572a4e868149f7a22fb2929347f837ae6a1f9b790f1b173"
+  }
+}

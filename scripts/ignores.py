@@ -104,14 +104,17 @@ def load_rules(directory):
 def is_ignored(path, is_dir, rules):
     """Last-match-wins across the inherited rule stack."""
     verdict = False
+    relative = {}  # one relpath per ignore file, not per rule: 365-rule files exist
     for rule in rules:
-        try:
-            rel = os.path.relpath(path, rule.base)
-        except ValueError:
-            continue
+        if rule.base not in relative:
+            try:
+                rel = os.path.relpath(path, rule.base)
+            except ValueError:
+                rel = ".."
+            relative[rule.base] = rel.replace(os.sep, "/")
+        rel = relative[rule.base]
         if rel.startswith(".."):
             continue
-        rel = rel.replace(os.sep, "/")
         if rule.matches(rel, is_dir):
             verdict = not rule.negated
     return verdict
