@@ -23,7 +23,7 @@
     "tree-sitter-sql": {"version": "0.3.11", "languages": ["sql"]},
     "tree-sitter-typescript": {"version": "0.23.2", "languages": ["typescript", "tsx", "vue", "svelte"]},
     "codebase-index-tree-sitter-fish": {
-      "version": "0.1.0+gb7f1d682",
+      "version": "0.1.0",
       "languages": ["fish"],
       "local": "packaging/fish",
       "_note": "No upstream Python distribution exists; built from the pinned grammar sources in packaging/fish."

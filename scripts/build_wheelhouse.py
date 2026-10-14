@@ -5,7 +5,9 @@ Not used at runtime. It needs network access to PyPI, plus `build`,
 `auditwheel` and `patchelf` for the locally packaged Fish grammar:
 
     python3 -m venv /tmp/wh && /tmp/wh/bin/pip install build auditwheel patchelf
-    /tmp/wh/bin/python scripts/build_wheelhouse.py
+    PATH=/tmp/wh/bin:$PATH /tmp/wh/bin/python scripts/build_wheelhouse.py
+
+(auditwheel looks up `patchelf` on PATH, so the venv's bin must be on it.)
 
 Outputs, all generated (do not edit by hand):
     vendor/wheels/*.whl              flat: abi3 wheels serve every target once
@@ -109,6 +111,7 @@ def build_local(dist, entry, dest):
         return name
 
 
+_SAFE_NAME = re.compile(r"[A-Za-z0-9._-]+")
 _LICENSE = re.compile(r"(^|/)(LICEN[CS]E|COPYING|NOTICE)[^/]*$", re.IGNORECASE)
 
 
@@ -169,6 +172,11 @@ def main():
                 name = local_built[dist]
             else:
                 name = download(dist, entry["version"], target, wheel_dir)
+            if not _SAFE_NAME.fullmatch(name):
+                sys.exit(
+                    f"{name}: characters outside [A-Za-z0-9._-]; the skill importer "
+                    "rejects such paths (drop any PEP 440 '+local' version label)"
+                )
             files.append(name)
             path = os.path.join(wheel_dir, name)
             wheels[name] = {

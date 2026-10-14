@@ -6,8 +6,10 @@ build-backend = "setuptools.build_meta"
 # Distinct name: no upstream Python distribution exists. The import name is the
 # conventional one, so codebase-index loads it like every other grammar.
 name = "codebase-index-tree-sitter-fish"
-# Local label carries the pinned upstream revision (see SOURCE.json).
-version = "0.1.0+gb7f1d682"
+# The pinned upstream revision lives in SOURCE.json. No PEP 440 local label
+# ("+g<rev>"): it puts '+' into the wheel filename, which the skill importer
+# rejects. Bump this when SOURCE.json moves to a new revision.
+version = "0.1.0"
 description = "Fish grammar for tree-sitter, Python binding (codebase-index local wrapper)"
 readme = "README.md"
 license = "Unlicense"
