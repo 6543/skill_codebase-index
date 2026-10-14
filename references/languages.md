@@ -110,11 +110,19 @@ from preceding comments.
 
 ### Vue and Svelte
 
-No maintained Python wheel exists for either grammar, so the `<script>` block is
+No maintained Python wheel exists for either grammar, so `<script>` blocks are
 extracted with a regex and parsed as TypeScript. Line numbers are offset back to
-the original file and are exact. Template markup, styles, and multiple script
-blocks beyond the first are not analysed. For Vue this covers `<script setup>`
-fully, which is where the logic lives in Vue 3.
+the original file and are exact.
+
+**Every** script block is parsed, not just the first. Vue 3 routinely pairs
+`<script setup>` with a plain `<script>` holding options or a named export, and
+Svelte pairs the instance script with `context="module"`; reading only the first
+match silently dropped whichever came second. `outline` labels each block when a
+file has more than one.
+
+Template markup and styles are not analysed. A handler bound only in the
+template therefore has no visible caller, which is the commonest way a `refs` or
+`trace` result on a component is misleading.
 
 ### JavaScript and TypeScript
 
@@ -157,6 +165,24 @@ Each `LangSpec` lists node types per concept:
 | `impl_blocks` | Rust-style containers that attach methods to a type |
 | `name_hook` | `c_declarator`, `js_assigned`, or `python_doc` |
 | `sfc` | set when the file is a single-file component |
+
+Four registries sit alongside the specs rather than inside them, because they
+are language-agnostic sets that every grammar contributes to:
+
+| Registry | Used by | Contents |
+|---|---|---|
+| `DECISION_NODES` | `complexity` | branch points, every grammar's spelling |
+| `CONTRACT_NODES` | `trace` | signature-only declarations, so dispatch is not resolved |
+| `SPAWN_NODES`, `SPAWN_CALLEES` | `effects` | goroutine, await, defer, thread pool |
+| `SERIALIZATION_CALLEES` | `effects` | encode/decode pairs across the ecosystem |
+
+A grammar that lacks one of these node types simply never hits it, which is why
+one set covers all languages.
+
+Interface members are recognised either by node type (`method_elem`,
+`method_signature`, `function_signature_item`) or, for grammars that give
+interface methods the same node type as ordinary ones — Java is the case that
+matters — by checking the enclosing type against the spec's `ifaces`.
 
 ## Adding a language
 
@@ -201,3 +227,14 @@ Both projects build a persistent graph database. This skill deliberately does
 not: it stays a stateless query tool so there is no index to build, invalidate,
 or keep in sync with edits. Where they trade setup cost for richer traversal,
 this trades traversal depth for zero setup.
+
+A sibling skill, **`trace-codebase-flow`**, solves the same problem with a
+different shape: one flat record index (symbols, calls, callbacks, control flow,
+channels, boundaries) with `search` and `trace` over it. Reading it produced the
+`trace` and `effects` commands here, the refusal to resolve interface dispatch,
+credential and header-based generated-code exclusion, the multi-block
+single-file-component fix, and the parse-error warning with its Nix
+trailing-comma exception. Its command shape was not adopted — this skill keeps
+one command per question, and attaches doc comments, which the record model
+drops — but its blind-spot analysis was, and is written up in
+[tracing.md](tracing.md).

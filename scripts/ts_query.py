@@ -17,6 +17,8 @@ Commands
   consts  <root>                const / static / enum-value declarations
   todos   <root>                TODO / FIXME / HACK comments, attributed to their decl
   impls   <Iface> <root>        types whose method set covers an interface
+  trace   <Name> <root>         multi-hop call graph, with unresolved edges listed
+  effects <root>                async spawns, channel ops, wire boundaries, callbacks
   complexity <root>             cyclomatic complexity per function, worst first
   cycles  <root>                circular imports between files
   langs                         supported languages and which grammars are installed
@@ -24,12 +26,17 @@ Commands
 
 Filters (any command taking <root>)
   --tests          include test files (default: excluded)
-  --mocks          include generated mocks (default: excluded)
+  --mocks          include generated mocks and generated code (default: excluded)
   --lang=<key>     restrict to one language (see `langs`)
   --json           machine-readable output
   --no-gitignore   do not read .gitignore files
   --min=<n>        complexity: only report functions at or above <n>
   --max-len=<n>    cycles: longest cycle to search for (default 6)
+  --depth=<n>      trace: hops to follow (default 3); debug-ast: tree depth
+  --callers        trace: follow inbound edges instead of outbound
+  --both           trace: follow edges in both directions
+  --kind=<k>       effects: only spawn, channel, boundary or callback
+  --max-bytes=<n>  skip source files larger than n bytes (default 2000000)
 
 Paths may be a file or a directory. Directories are walked recursively.
 """
@@ -49,13 +56,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ignores
 from languages import (
     ALL,
+    ARGUMENT_NODES,
     BY_EXT,
     BY_KEY,
+    CONTRACT_NODES,
     DECISION_NODES,
     DECISION_OPERATORS,
+    GENERATED_MARKERS,
     LOCKFILES,
     MOCK_PATTERNS,
+    REFERENCE_NODES,
+    SENSITIVE_NAMES,
+    SENSITIVE_PREFIXES,
+    SENSITIVE_SUFFIXES,
+    SERIALIZATION_CALLEES,
     SKIP_DIRS,
+    SPAWN_CALLEES,
+    SPAWN_NODES,
     TEST_PATTERNS,
     TODO_MARKERS,
 )
@@ -70,6 +87,7 @@ _CACHE_LIMIT = 4000
 _LANG_CACHE = {}
 _PARSER_CACHE = {}
 _MISSING = set()
+_PARSE_ERRORS = set()
 
 
 # --------------------------------------------------------------------------
@@ -104,21 +122,28 @@ SCRIPT_BLOCK = re.compile(
 )
 
 
-def read_source(path, spec):
-    """Return (source_bytes, line_offset). SFC files yield just their script block."""
+def read_segments(path, spec):
+    """Return [(source_bytes, line_offset)] -- one entry per parseable region.
+
+    A plain source file is one region. A single-file component is one region per
+    `<script>` block: Vue 3 routinely has two (`<script setup>` for the logic and
+    a plain `<script>` for options such as `defineOptions` or a named export),
+    and Svelte's `context="module"` block is the same shape. Reading only the
+    first block silently lost whichever one happened to come second.
+    """
     with open(path, "rb") as handle:
         raw = handle.read()
     if not spec.sfc:
-        return raw, 0
-    match = SCRIPT_BLOCK.search(raw)
-    if not match:
-        return b"", 0
-    offset = raw[: match.start("body")].count(b"\n")
-    return match.group("body"), offset
+        return [(raw, 0)]
+    return [
+        (match.group("body"), raw[: match.start("body")].count(b"\n"))
+        for match in SCRIPT_BLOCK.finditer(raw)
+        if match.group("body").strip()
+    ]
 
 
 def parse(path):
-    """-> (source, tree, spec, line_offset) or None if unsupported/ungrammared."""
+    """-> [(source, tree, spec, line_offset)], one per region; [] if unsupported."""
     if path in _PARSE_CACHE:
         return _PARSE_CACHE[path]
     result = _parse_uncached(path)
@@ -130,14 +155,50 @@ def parse(path):
 def _parse_uncached(path):
     spec = spec_for(path)
     if spec is None:
-        return None
+        return []
     parser = get_parser(spec)
     if parser is None:
-        return None
-    src, offset = read_source(path, spec)
-    if not src.strip():
-        return None
-    return src, parser.parse(src), spec, offset
+        return []
+    out = []
+    for src, offset in read_segments(path, spec):
+        if not src.strip():
+            continue
+        tree = parser.parse(src)
+        if has_real_error(tree.root_node, src, spec):
+            _PARSE_ERRORS.add(path)
+        out.append((src, tree, spec, offset))
+    return out
+
+
+def has_real_error(root, src, spec):
+    """Whether a parse failure is worth warning about.
+
+    tree-sitter recovers from errors rather than failing, so a partly wrong tree
+    looks exactly like a right one. The Nix grammar flags a *missing* identifier
+    after a legal trailing comma in a formal argument set, which is valid Nix and
+    appears in most NixOS modules; that one artefact is suppressed and every
+    other error is reported.
+    """
+    if not root.has_error:
+        return False
+    stack = [root]
+    while stack:
+        cur = stack.pop()
+        if cur.type == "ERROR":
+            return True
+        if cur.is_missing and (spec.key != "nix" or not _harmless_nix_comma(cur, src)):
+            return True
+        if cur.has_error:
+            stack.extend(cur.children)
+    return False
+
+
+def _harmless_nix_comma(node, src):
+    if node.type != "identifier":
+        return False
+    before = src[: node.start_byte].rstrip()
+    after = src[node.start_byte :].lstrip()
+    return before.endswith(b",") and after.startswith(b"}")
 
 
 # --------------------------------------------------------------------------
@@ -348,6 +409,20 @@ def doc_comment(node, spec):
         out.append(text(prev).rstrip())
         boundary = prev.start_point[0]
         prev = prev.prev_sibling
+
+    if (
+        not out
+        and node.parent is not None
+        and node.parent.start_point[0] == node.start_point[0]
+        and node.parent.named_children[:1] == [node]
+    ):
+        # Several grammars wrap the named declaration in an outer node carrying
+        # the keyword -- Go's `type_declaration` around `type_spec`, TypeScript's
+        # `export_statement` around the class. The comment is a sibling of the
+        # wrapper, so it is invisible from the inner node. Only a wrapper opening
+        # on the same line, with this node as its first child, is followed, so
+        # this cannot walk out of a block and steal an unrelated comment.
+        return doc_comment(node.parent, spec)
     return list(reversed(out))
 
 
@@ -431,6 +506,38 @@ def is_mock(path):
     return any(p in lowered for p in MOCK_PATTERNS)
 
 
+def is_sensitive(path):
+    """Credentials and keys, excluded before the file is ever opened."""
+    name = os.path.basename(path).lower()
+    _, ext = os.path.splitext(name)
+    return (
+        name in SENSITIVE_NAMES
+        or ext in SENSITIVE_SUFFIXES
+        or name.startswith(SENSITIVE_PREFIXES)
+    )
+
+
+def is_generated(path, head_bytes=2048):
+    """Whether a file announces itself as machine-written in its header.
+
+    Naming conventions for generated code are inconsistent enough that a
+    filename check alone misses most of it. The header marker is a convention
+    the generators themselves follow, so it catches mockery, protoc, sqlc and
+    stringer output without a per-tool pattern list.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(head_bytes)
+    except OSError:
+        return False
+    return any(marker in head for marker in GENERATED_MARKERS)
+
+
+# A source file this large is minified, vendored, or a data blob. Parsing one
+# costs seconds and its declarations are never the answer to the question.
+_MAX_BYTES = 2_000_000
+
+
 def iter_files(root, opts):
     """Yield source files under *root*, honouring .gitignore.
 
@@ -470,18 +577,24 @@ def iter_files(root, opts):
                 continue
             if opts["lang"] and spec.key != opts["lang"]:
                 continue
+            if is_sensitive(path):
+                continue
             if not opts["tests"] and is_test(path):
                 continue
-            if not opts["mocks"] and is_mock(path):
+            if not opts["mocks"] and (is_mock(path) or is_generated(path)):
+                continue
+            try:
+                if os.path.getsize(path) > int(opts.get("max_bytes", _MAX_BYTES)):
+                    continue
+            except OSError:
                 continue
             yield path
 
 
 def iter_parsed(root, opts):
     for path in iter_files(root, opts):
-        parsed = parse(path)
-        if parsed is not None:
-            yield (path,) + parsed
+        for segment in parse(path):
+            yield (path,) + segment
 
 
 # --------------------------------------------------------------------------
@@ -638,11 +751,18 @@ def render_const(node, spec):
 
 
 def cmd_outline(path, opts, emit):
-    parsed = parse(path)
-    if parsed is None:
+    segments = parse(path)
+    if not segments:
         emit(f"unsupported or unparseable: {path}")
         return
-    src, tree, spec, offset = parsed
+    for index, segment in enumerate(segments):
+        if len(segments) > 1:
+            emit(f"--- script block {index + 1} of {len(segments)} ---")
+        outline_segment(segment, emit)
+
+
+def outline_segment(segment, emit):
+    src, tree, spec, offset = segment
     root_node = tree.root_node
 
     for node in walk(root_node, spec.module_decl):
@@ -802,19 +922,65 @@ def rank_candidates(candidates, call_site):
     return survivors, "AMBIGUOUS"
 
 
+def callee_expression(node, spec):
+    """The expression naming what a call node invokes, or None."""
+    fn = node.child_by_field_name("function") or node.child_by_field_name("name")
+    if fn is None and node.named_children:
+        fn = node.named_children[0]
+    if fn is None:
+        return None
+    return " ".join(text(fn).split())
+
+
+def resolve_call(qualified, node, spec, path, src, offset, declarations):
+    """Rank the declarations that could be the target of one call site."""
+    pool = declarations
+    # A qualified call such as `p.q.Poll` is dispatched on another receiver, so
+    # the enclosing method of the same name is not the callee -- without this, a
+    # wrapper method resolves to itself.
+    if any(sep in qualified for sep in (".", "::", "->")):
+        span = enclosing_span(node, spec)
+        if span is not None:
+            enclosing_line = src[: span[0]].count(b"\n") + 1 + offset
+            pool = [
+                c for c in declarations if not (c[0] == path and c[1] == enclosing_line)
+            ] or declarations
+    return rank_candidates(pool, path)
+
+
+def argument_references(node, spec):
+    """Bare references passed as arguments -- a callback handed to a registrar.
+
+    `router.POST("/hook", api.PostHook)` creates no call edge to PostHook: the
+    framework calls it later, from a stack that has no textual link to this
+    line. Passing a function by name is the one part of that handoff that *is*
+    visible in the syntax, so it is worth reporting as an indirect edge.
+    """
+    args = node.child_by_field_name("arguments") or node.child_by_field_name(
+        "argument_list"
+    )
+    if args is None:
+        for child in node.named_children:
+            if child.type in ARGUMENT_NODES:
+                args = child
+                break
+    if args is None:
+        return []
+    return [
+        " ".join(text(child).split())
+        for child in args.named_children
+        if child.type in REFERENCE_NODES
+    ]
+
+
 def cmd_refs(name, root, opts, emit):
     declarations = declaration_sites(name, root, opts)
     hits = 0
     for path, src, tree, spec, offset in iter_parsed(root, opts):
         for node in walk(tree.root_node, spec.calls):
-            fn = node.child_by_field_name("function") or node.child_by_field_name(
-                "name"
-            )
-            if fn is None and node.named_children:
-                fn = node.named_children[0]
-            if fn is None:
+            qualified = callee_expression(node, spec)
+            if qualified is None:
                 continue
-            qualified = " ".join(text(fn).split())
             bare = split_qualifier(qualified)
             if bare != name:
                 continue
@@ -823,20 +989,9 @@ def cmd_refs(name, root, opts, emit):
             shown = (
                 f"{qualified}(...)" if is_call else " ".join(text(node).split())[:70]
             )
-            # A qualified call such as `p.q.Poll` is dispatched on another
-            # receiver, so the enclosing method of the same name is not the
-            # callee -- without this, a wrapper method resolves to itself.
-            pool = declarations
-            if "." in qualified or "::" in qualified or "->" in qualified:
-                span = enclosing_span(node, spec)
-                if span is not None:
-                    enclosing_line = src[: span[0]].count(b"\n") + 1 + offset
-                    pool = [
-                        c
-                        for c in declarations
-                        if not (c[0] == path and c[1] == enclosing_line)
-                    ] or declarations
-            ranked, confidence = rank_candidates(pool, path)
+            ranked, confidence = resolve_call(
+                qualified, node, spec, path, src, offset, declarations
+            )
             target = ""
             if ranked:
                 best = ranked[0]
@@ -1003,6 +1158,421 @@ def cmd_impls(ifacename, root, opts, emit):
     emit(
         "\nnote: name-based method-set cover. It ignores signatures and does not "
         "expand embedded/inherited members, so verify before relying on it."
+    )
+
+
+# --------------------------------------------------------------------------
+# call graph
+# --------------------------------------------------------------------------
+
+
+def enclosing_def(node, spec):
+    """Nearest enclosing function, else nearest enclosing type, else None.
+
+    A call is attributed to the function it sits in. Calls at file scope -- a
+    top-level registration in an `init()`-less module, a Nix binding applied at
+    the root of the file -- have no enclosing function and are attributed to the
+    file instead, since dropping them would hide exactly the framework wiring
+    the graph is supposed to expose.
+    """
+    cur = node.parent
+    fallback = None
+    while cur is not None:
+        if cur.type in spec.defs:
+            return cur
+        if fallback is None and cur.type in spec.types:
+            fallback = cur
+        cur = cur.parent
+    return fallback
+
+
+def is_contract(node, spec):
+    """Whether a declaration only promises behaviour, leaving the target dynamic."""
+    if node.type in CONTRACT_NODES:
+        return True
+    if not spec.ifaces:
+        return False
+    cur = node.parent
+    while cur is not None:
+        if cur.type in spec.ifaces:
+            return True
+        if cur.type in spec.defs or cur.type in spec.impl_blocks:
+            return False
+        cur = cur.parent
+    return False
+
+
+def collect_declarations(root, opts):
+    """-> (nodes, by_name, by_func, contract_keys)
+
+    The key is `path:line`, which is unique and stable regardless of how many
+    same-named declarations the repo has. `label` is what a human wants to read.
+    `by_func` holds functions only: a value handed to a call is a callback when
+    it names a function, and a variable sharing a name with a *type* is the
+    commonest false positive there is. `contract_keys` holds the declarations
+    that are interface members rather than implementations.
+    """
+    nodes = {}
+    by_name = {}
+    by_func = {}
+    contract_keys = set()
+    for path, src, tree, spec, offset in iter_parsed(root, opts):
+        for node in walk(tree.root_node, tuple(set(spec.defs) | set(spec.types))):
+            name = resolve_name(node, spec)
+            if not name or name == "<anonymous>":
+                continue
+            line = line_of(src, node, offset)
+            owner = receiver_type(node, spec)
+            key = f"{path}:{line}"
+            nodes[key] = {
+                "path": path,
+                "line": line,
+                "name": name,
+                "owner": owner,
+                "label": f"{owner}.{name}" if owner else name,
+                "lang": spec.key,
+            }
+            by_name.setdefault(name, []).append((path, line, owner))
+            if node.type in spec.defs:
+                by_func.setdefault(name, []).append((path, line, owner))
+            if is_contract(node, spec):
+                contract_keys.add(key)
+    return nodes, by_name, by_func, contract_keys
+
+
+def external_heads(root, opts):
+    """-> {path: {head, ...}} for imports that resolve outside this repo.
+
+    `rand.New(...)` after `import "math/rand"` has nothing to do with a local
+    `New`, but the name matches, so without this every stdlib call drags the
+    repo's own same-named declarations into the candidate list. Imports that do
+    resolve to a file in the repo are left alone: `queue.Push` after
+    `import { queue } from "./queue"` is a real edge worth following.
+    """
+    by_module, by_stem = {}, {}
+    for path, _, _, _, _ in iter_parsed(root, opts):
+        stem, _ = os.path.splitext(path)
+        by_module[stem] = path
+        by_module[path] = path
+        rel = os.path.relpath(stem, root).replace(os.sep, "/")
+        by_module.setdefault(rel, path)
+        by_module.setdefault(os.path.dirname(rel), path)
+        by_stem.setdefault(os.path.basename(stem), []).append(path)
+
+    heads = {}
+    for path, _, tree, spec, _ in iter_parsed(root, opts):
+        for node in walk(tree.root_node, spec.imports):
+            if not is_import_node(node, spec):
+                continue
+            for target in import_targets(node, spec, path):
+                if resolve_import(target, path, root, by_module, by_stem):
+                    continue
+                tail = target.replace("\\", "/").rstrip("/").split("/")[-1]
+                tail = tail.split(".")[0].strip("\"'")
+                if tail:
+                    heads.setdefault(path, set()).add(tail)
+                alias = field(node, "name")
+                if alias and alias.isidentifier():
+                    heads.setdefault(path, set()).add(alias)
+    return heads
+
+
+def build_graph(root, opts):
+    """-> (nodes, out_edges, in_edges, unresolved)
+
+    An edge is only recorded when ranking left exactly one plausible target.
+    Where several survive, the call becomes an *unresolved* entry instead: a
+    guessed edge that reads like a fact is worse than an admitted gap, and
+    interface dispatch -- the case that matters most -- is precisely the case
+    that stays ambiguous.
+    """
+    nodes, by_name, by_func, contract_keys = collect_declarations(root, opts)
+    outside = external_heads(root, opts)
+    out_edges, in_edges, unresolved = {}, {}, []
+
+    for path, src, tree, spec, offset in iter_parsed(root, opts):
+        for node in walk(tree.root_node, spec.calls):
+            qualified = callee_expression(node, spec)
+            if qualified is None:
+                continue
+            line = line_of(src, node, offset)
+            owner_node = enclosing_def(node, spec)
+            caller = (
+                f"{path}:{line_of(src, owner_node, offset)}"
+                if owner_node is not None
+                else f"{path}:0"
+            )
+            if caller not in nodes:
+                nodes.setdefault(
+                    caller,
+                    {
+                        "path": path,
+                        "line": 0,
+                        "name": os.path.basename(path),
+                        "owner": "",
+                        "label": f"<file scope> {os.path.basename(path)}",
+                        "lang": spec.key,
+                    },
+                )
+
+            targets = [(split_qualifier(qualified), qualified, "call")]
+            targets += [
+                (split_qualifier(arg), arg, "callback")
+                for arg in argument_references(node, spec)
+            ]
+            for bare, expr, kind in targets:
+                head = re.split(r"->|::|\.", expr)[0].strip()
+                if head != expr and head in outside.get(path, ()):
+                    continue
+                table = by_func if kind == "callback" else by_name
+                if len(bare) < 3 or bare not in table:
+                    continue
+                pool = table[bare]
+
+                # A name shared by an interface member and its implementations
+                # is dynamic dispatch. The syntax records which contract is
+                # being called and says nothing about which body runs, so the
+                # only honest answer is the candidate list.
+                implementations = [
+                    c for c in pool if f"{c[0]}:{c[1]}" not in contract_keys
+                ]
+                dispatched = len(implementations) != len(pool)
+                if dispatched and len(implementations) != 1:
+                    unresolved.append(
+                        {
+                            "caller": caller,
+                            "expr": expr,
+                            "path": path,
+                            "line": line,
+                            "kind": "dispatch",
+                            "candidates": [f"{c[0]}:{c[1]}" for c in pool],
+                        }
+                    )
+                    continue
+                if dispatched:
+                    pool = implementations
+
+                ranked, confidence = resolve_call(
+                    expr, node, spec, path, src, offset, pool
+                )
+                if dispatched:
+                    # One implementor is a strong guess, not a fact: another may
+                    # live outside this repo.
+                    confidence = "INFERRED"
+                if not ranked:
+                    continue
+                best = f"{ranked[0][0]}:{ranked[0][1]}"
+                if confidence == "AMBIGUOUS":
+                    unresolved.append(
+                        {
+                            "caller": caller,
+                            "expr": expr,
+                            "path": path,
+                            "line": line,
+                            "kind": kind,
+                            "candidates": [f"{c[0]}:{c[1]}" for c in ranked],
+                        }
+                    )
+                    continue
+                if best == caller or best not in nodes:
+                    continue
+                edge = (caller, best, path, line, kind, confidence)
+                out_edges.setdefault(caller, []).append(edge)
+                in_edges.setdefault(best, []).append(edge)
+    return nodes, out_edges, in_edges, unresolved
+
+
+def seed_keys(nodes, name):
+    """Declarations a trace starts from.
+
+    Exact matches only, unless there are none: a substring fallback on a name
+    like `Scale` matches every method of an `Autoscaler`, which turns one
+    question into fifty answers. The fallback matches the declaration's own name
+    rather than its qualified label, for the same reason.
+    """
+
+    def ordered(keys):
+        return sorted(keys, key=lambda key: (nodes[key]["path"], nodes[key]["line"]))
+
+    exact = [
+        key
+        for key, node in nodes.items()
+        if node["name"] == name or node["label"] == name
+    ]
+    if exact:
+        return ordered(exact)
+    lowered = name.casefold()
+    return ordered(
+        key for key, node in nodes.items() if lowered in node["name"].casefold()
+    )
+
+
+def cmd_trace(name, root, opts, emit):
+    nodes, out_edges, in_edges, unresolved = build_graph(root, opts)
+    seeds = seed_keys(nodes, name)
+    if not seeds:
+        emit(f"no declaration matching {name!r} found under {root}")
+        return
+
+    depth = int(opts.get("depth", 3))
+    if opts.get("both"):
+        direction, sources = "callers and callees", (in_edges, out_edges)
+    elif opts.get("callers"):
+        direction, sources = "callers", (in_edges,)
+    else:
+        direction, sources = "callees", (out_edges,)
+
+    visited = set(seeds)
+    reported = []
+
+    def expand(key, level, prefix):
+        if level >= depth:
+            return
+        seen_here = []
+        for table in sources:
+            for edge in table.get(key, []):
+                other = edge[1] if table is out_edges else edge[0]
+                arrow = "->" if table is out_edges else "<-"
+                seen_here.append((other, arrow, edge))
+        for other, arrow, edge in sorted(
+            {(o, a, e) for o, a, e in seen_here}, key=lambda item: item[2][3]
+        ):
+            _, _, epath, eline, kind, confidence = edge
+            node = nodes[other]
+            repeat = other in visited
+            emit(
+                f"{prefix}{arrow} {node['label']}  ({node['path']}:{node['line']})"
+                f"  [{kind}, {confidence}]  at {epath}:{eline}"
+                + ("  (already shown)" if repeat else "")
+            )
+            reported.append((other, edge))
+            if repeat:
+                continue
+            visited.add(other)
+            expand(other, level + 1, prefix + "  ")
+
+    for seed in seeds:
+        node = nodes[seed]
+        emit(f"{node['label']}  ({node['path']}:{node['line']})")
+        expand(seed, 0, "  ")
+        emit("")
+
+    open_ends = [item for item in unresolved if item["caller"] in visited]
+    if open_ends:
+        emit("unresolved (several candidates survived ranking, so nothing was chosen):")
+        for item in open_ends[:25]:
+            caller = nodes[item["caller"]]["label"]
+            emit(
+                f"  {caller} -> {item['expr']}  [{item['kind']}]  "
+                f"{item['path']}:{item['line']}"
+            )
+            for candidate in item["candidates"][:4]:
+                emit(f"      candidate: {nodes[candidate]['label']}  ({candidate})")
+        if len(open_ends) > 25:
+            emit(f"  ... {len(open_ends) - 25} more")
+
+    emit(
+        f"\ndirection {direction}, depth {depth}. Edges are name-based, not type-"
+        "resolved: an interface call, a reflected call, or a call through a "
+        "generated client leaves no edge here. Verify an INFERRED hop before "
+        "relying on it."
+    )
+
+
+# --------------------------------------------------------------------------
+# effects
+# --------------------------------------------------------------------------
+
+
+def channel_effect(node, src, spec):
+    """Go channel send or receive, as (kind, detail) or None."""
+    if spec.key != "go":
+        return None
+    if node.type == "send_statement":
+        channel = field(node, "channel")
+        return ("channel", f"send to {channel}") if channel else None
+    if node.type == "unary_expression":
+        body = " ".join(text(node).split())
+        if body.startswith("<-"):
+            return ("channel", f"receive from {body[2:].strip()}")
+    return None
+
+
+def cmd_effects(root, opts, emit):
+    """Report the transitions a call graph cannot carry.
+
+    Everything here is a point where control or data leaves the path the reader
+    was following: work handed to another execution context, a value crossing a
+    channel, a value crossing an encoder, or a function handed to something that
+    will call it later. These are where a trace goes wrong silently, so they are
+    worth listing before drawing conclusions from one.
+    """
+    wanted = opts.get("kind", "")
+    functions = set()
+    for _, _, tree, spec, _ in iter_parsed(root, opts):
+        for node in walk(tree.root_node, spec.defs):
+            name = resolve_name(node, spec)
+            if name and len(name) > 2:
+                functions.add(name)
+
+    rows = []
+    for path, src, tree, spec, offset in iter_parsed(root, opts):
+        types = (
+            tuple(SPAWN_NODES)
+            + tuple(spec.calls)
+            + ("send_statement", "unary_expression")
+        )
+        for node in walk(tree.root_node, types):
+            line = line_of(src, node, offset)
+            where = enclosing_decl(node, spec)
+            found = []
+
+            if node.type in SPAWN_NODES:
+                found.append(("spawn", SPAWN_NODES[node.type]))
+            channel = channel_effect(node, src, spec)
+            if channel is not None:
+                found.append(channel)
+            if node.type in spec.calls:
+                qualified = callee_expression(node, spec)
+                if qualified is not None:
+                    lowered = qualified.casefold()
+                    if lowered in SERIALIZATION_CALLEES:
+                        found.append(("boundary", qualified))
+                    elif lowered in SPAWN_CALLEES:
+                        found.append(("spawn", qualified))
+                    for arg in argument_references(node, spec):
+                        if split_qualifier(arg) in functions:
+                            found.append(("callback", f"{qualified}(... {arg} ...)"))
+
+            for kind, detail in found:
+                if wanted and kind != wanted:
+                    continue
+                rows.append((path, line, kind, detail, where))
+
+    if not rows:
+        emit(f"no async, channel, serialization or callback effects found under {root}")
+        return
+    if opts["json"]:
+        emit(
+            [
+                {"file": p, "line": ln, "kind": k, "detail": d, "in": w}
+                for p, ln, k, d, w in rows
+            ]
+        )
+        return
+
+    counts = {}
+    for _, _, kind, _, _ in rows:
+        counts[kind] = counts.get(kind, 0) + 1
+    emit("  ".join(f"{kind}: {count}" for kind, count in sorted(counts.items())) + "\n")
+    for path, line, kind, detail, where in sorted(rows)[:200]:
+        emit(f"{path}:{line}: [{kind}] {detail}   [{where}]")
+    if len(rows) > 200:
+        emit(f"\n... {len(rows) - 200} more")
+    emit(
+        "\nchannel detection is Go-only. A callback is reported when an argument "
+        "names a function declared in this repo, so a local variable that shadows "
+        "a function name shows up here too."
     )
 
 
@@ -1227,11 +1797,11 @@ def cmd_langs(_root, _opts, emit):
 
 
 def cmd_debug_ast(path, opts, emit):
-    parsed = parse(path)
-    if parsed is None:
+    segments = parse(path)
+    if not segments:
         emit(f"unsupported or unparseable: {path}")
         return
-    _, tree, spec, _ = parsed
+    _, tree, spec, _ = segments[0]
     maxdepth = int(opts["depth"])
 
     def dump(node, depth):
@@ -1266,6 +1836,8 @@ COMMANDS = {
     "consts": (cmd_consts, 1),
     "todos": (cmd_todos, 1),
     "impls": (cmd_impls, 2),
+    "trace": (cmd_trace, 2),
+    "effects": (cmd_effects, 1),
     "complexity": (cmd_complexity, 1),
     "cycles": (cmd_cycles, 1),
     "langs": (cmd_langs, 0),
@@ -1273,27 +1845,49 @@ COMMANDS = {
 }
 
 
-def main():
-    argv = sys.argv[1:]
+def default_opts(**overrides):
+    """Baseline flag values. One definition, shared by the CLI and the tests."""
     opts = {
-        "tests": "--tests" in argv,
-        "mocks": "--mocks" in argv,
-        "json": "--json" in argv,
-        "no_gitignore": "--no-gitignore" in argv,
+        "tests": False,
+        "mocks": False,
+        "json": False,
+        "no_gitignore": False,
+        "callers": False,
+        "both": False,
         "min": 1,
         "max_len": 6,
         "lang": "",
+        "kind": "",
         "depth": 3,
+        "max_bytes": _MAX_BYTES,
     }
+    opts.update(overrides)
+    return opts
+
+
+def main():
+    argv = sys.argv[1:]
+    opts = default_opts(
+        tests="--tests" in argv,
+        mocks="--mocks" in argv,
+        json="--json" in argv,
+        no_gitignore="--no-gitignore" in argv,
+        callers="--callers" in argv,
+        both="--both" in argv,
+    )
     for arg in argv:
         if arg.startswith("--lang="):
             opts["lang"] = arg.split("=", 1)[1]
+        if arg.startswith("--kind="):
+            opts["kind"] = arg.split("=", 1)[1]
         if arg.startswith("--depth="):
             opts["depth"] = arg.split("=", 1)[1]
         if arg.startswith("--min="):
             opts["min"] = arg.split("=", 1)[1]
         if arg.startswith("--max-len="):
             opts["max_len"] = arg.split("=", 1)[1]
+        if arg.startswith("--max-bytes="):
+            opts["max_bytes"] = arg.split("=", 1)[1]
     positional = [a for a in argv if not a.startswith("--")]
 
     if not positional or positional[0] not in COMMANDS:
@@ -1329,6 +1923,17 @@ def main():
         print(
             f"\n[grammars not installed, those files were skipped: "
             f"{' '.join(sorted(_MISSING))}]",
+            file=sys.stderr,
+        )
+    if _PARSE_ERRORS:
+        # tree-sitter recovers rather than failing, so a bad parse yields a
+        # partial tree that looks exactly like a good one. Results from these
+        # files are incomplete in ways nothing downstream can detect.
+        shown = sorted(_PARSE_ERRORS)[:5]
+        extra = f" (+{len(_PARSE_ERRORS) - 5} more)" if len(_PARSE_ERRORS) > 5 else ""
+        print(
+            f"\n[parse errors, results from these files are partial: "
+            f"{' '.join(shown)}{extra}]",
             file=sys.stderr,
         )
     return 0
