@@ -30,7 +30,7 @@ first.
 | Swift | `.swift` | `tree_sitter_swift` | protocols | `///` | one `parameter` node per argument, joined by the tool |
 | C# | `.cs` | `tree_sitter_c_sharp` | yes | `///` | properties reported as fields |
 | Ruby | `.rb .rake` | `tree_sitter_ruby` | n/a | `#` | modules and classes both appear as types |
-| PHP | `.php` | `tree_sitter_php` | yes | `/** */` | traits treated as types |
+| PHP | `.php` | `tree_sitter_php` | yes | `/** */` | bundled; `$this->f()`, `$x->f()`, `A::f()` keep their receiver; traits treated as types |
 | C++ | `.cc .cpp .cxx .hpp .hh .hxx`, C++ `.h` | `tree_sitter_cpp` | n/a | `//`, `/** */` | name and params live in the declarator chain |
 | C | `.c .h` | `tree_sitter_c` | n/a | same | `#define` as constant; prototypes listed apart |
 | Bash | `.sh .bash`, shebang | `tree_sitter_bash` | n/a | `#` | functions, assignments, `source`/`.` as imports |
@@ -43,7 +43,7 @@ first.
 | Lua | `.lua` | `tree_sitter_lua` | n/a | `--` | functions and locals; `M.run` keeps its table prefix |
 | Zig | `.zig` | `tree_sitter_zig` | n/a | `///` | struct name read from the enclosing `const` binding |
 | Julia | `.jl` | `tree_sitter_julia` | n/a | `#` | name nested under `type_head` / `signature` |
-| Nix | `.nix` | `tree_sitter_nix` | n/a | `#` | bindings are the only declaration form; see below |
+| Nix | `.nix` | `tree_sitter_nix` | n/a | `#` | bindings are the only declaration form; lexical scope and path imports; see below |
 
 ## Commands that do not apply
 
@@ -77,6 +77,27 @@ every command, text and JSON, 603 runs, none failed. Parse errors per region:
 
 A partial file is always listed in the stderr `parse errors` note.
 
+A second round (2026-10-14, one repository per bundled language, 18 plus PHP)
+compared each command with a grep or regex ground truth. What it found, and the
+state after the fixes:
+
+| Language | Project | Before | After |
+|---|---|---|---|
+| C | lua | 57 of 68 files partial; `LUA_API lua_CFunction f(...)` lost 2 of 81 API functions | 26 partial; 81 of 81 |
+| C++ | leveldb | `class LEVELDB_EXPORT DB` vanished; `methods DBImpl` 3 entries | 12 partial (was 29); `DB` found, `impls DB` lists `DBImpl`; 40 methods incl. out-of-class |
+| SQL | graphile/starter (`pg_dump`) | 26 of 40 functions, `users` table missing | 40 of 40, 12 of 12 tables; trigger reaches its function |
+| TypeScript | zod | 4 densest files partial (`<in T>`, `<out O>`) | 0 |
+| CSS | animate.css | 6 files partial (`6.5% {`) | 0 |
+| Bash | bats-core | 3 partial (`${1//&/\&amp;}`) | 2 |
+| Fish | tide | `refs` 40 of 46 (command after `a=$x \` continuation) | 46 of 46 |
+| Java | gson | `impls TypeAdapterFactory`: 20 listed, 14 wrong (anonymous classes) | declared implementors only |
+| C# | MediatR | `impls IRequestHandler` matched any `Handle`; `iface IMediator` empty | base list is authoritative; inherited interfaces expanded |
+| Go | woodpecker | `ctx.Err()` drawn as edge to `Runtime.Err`; `os/exec` matched `cli/exec`, false cycles | receiver typed or unresolved; imports resolved through `go.mod` |
+| Rust | fd | `paths.is_empty()` drawn to free fn `is_empty`; `cycles` 0 edges | no edge; `crate::`/`super::` resolve |
+| Python | flask | `self.app` argument drawn as callback; 25 cycles from `TYPE_CHECKING` imports | no callback; those imports reported apart |
+| Nix | disko | `lib.mkOption` EXTRACTED to an unrelated `lib` binding; 5 of 115 path edges | lexical scope; `import`/`callPackage`/`imports` paths resolve |
+| PHP | Slim | not bundled; `$x->go()` read as bare `go()` | bundled; receivers kept |
+
 ### Nix
 
 Nix is one target not fitting class/method/interface shape other specs assume.
@@ -101,6 +122,24 @@ Pretending otherwise gave bad output until each of these handled:
   between using a value and calling it.
 - **Package functions take dozens of arguments.** 51-argument formal list is
   outline noise. Summarised as `{ 51 args }`.
+- **Lexical scope.** A name bound by an enclosing lambda (`{ lib, ... }:`), `let`
+  or `rec` set is resolved there, never to a same-named binding elsewhere: `refs`
+  labels a lambda argument `LOCAL`, a `let` name resolves to that binding
+  (`EXTRACTED`), and an attribute selected off a local (`lib.mkOption`) draws no
+  edge. A free name or one only a `with` can supply stays name-based, at most
+  `INFERRED`.
+- **Paths are the module edges.** `import ./x`, `callPackage ./pkg.nix {}` and
+  `imports = [ ./mod.nix ./dir ]` (a directory means its `default.nix`) are edges
+  for `cycles`, and `refs <file>` lists who imports a file with the kind. Other
+  relative path literals (`src = ./.`) are references only. `./x/${name}.nix` and
+  `import "${p}/x.nix"` are computed: `cycles` lists them as unresolved.
+
+Grammar provenance: the bundle ships PyPI `tree-sitter-nix` 0.1.0 (MIT, homepage
+`github.com/tree-sitter/tree-sitter-nix`, the repository now maintained as
+`nix-community/tree-sitter-nix`). It predates current nix-community master, and
+nixpkgs builds its own grammar from yet another revision. The Nix route of this
+skill installs the same wheel, not nixpkgs' grammar, so both routes parse
+identically; every node type used is pinned by `NixTest` and `NixScopeTest`.
 
 ### Not supported
 
@@ -184,6 +223,27 @@ from 1/16 to 16/16 for DB2 and Oracle, 2/16 to 15/16 for SQL Server.
 - Not parsed: T-SQL `CREATE PROCEDURE`, Oracle PL/SQL blocks, Postgres
   `PARTITION OF`, SQLite `AUTOINCREMENT` triggers, psql meta-commands
   (`\restrict`). Each costs only its own statement. Dynamic SQL is invisible.
+
+Dialect coverage: PostgreSQL (including `pg_dump` output and PL/pgSQL bodies)
+and MySQL are the supported dialects; ANSI SQL parses mostly; SQLite, T-SQL,
+Oracle and DB2 parse statement by statement, partly. Statements the grammar
+rejects are retried with same-length masks, applied only when they lower the
+error count: function attribute lines (`SET search_path TO ...`, `SECURITY
+DEFINER`, `STABLE`, ...), `OPERATOR(schema.op)`, parameter defaults
+(`DEFAULT NULL::citext`), keyword-named parameters (`name text`), PL/pgSQL
+control flow and `=` assignments. As a last resort a routine's body is blanked:
+the declaration survives, references inside the body do not, and stderr lists
+those routines. `decl` always prints the original text.
+
+### PHP
+
+Bundled in the common profile (PyPI `tree-sitter-php` 0.25.1, MIT). A member call
+keeps its receiver (`$this->save()`, `$x->go()`, `self::make()`,
+`Foo::bar()`), so `$this->`/`self::` resolve in the class, a typed property or
+parameter (`private Store $store`, `function f(Store $s)`) selects that class,
+and an untyped variable draws no edge. `use App\Routing\Route;` resolves through
+the trailing path (PSR-4: `src/Routing/Route.php`). `impls` lists classes whose
+`implements`/`extends` clause names the interface.
 
 ### PowerShell
 
@@ -269,6 +329,31 @@ types keep qualifiers and pointers (`-> const char *`).
 - Preprocessor macros reported as constants. No expansion attempted, so macro
   wrappers (`FMT_BEGIN_NAMESPACE`) leave partial parses; a garbled signature is cut
   to one line.
+- Attribute-like macros are blanked before parsing: export/visibility macros
+  (`LUA_API`, `LEVELDB_EXPORT`, `FOO_DLL`) everywhere outside `#` lines, and on
+  error lines also `class MACRO Name`, a leading all-caps macro before a
+  declaration, and trailing annotations (`EXCLUSIVE_LOCKS_REQUIRED(mu_)`,
+  `GUARDED_BY(mu)`). `decl` prints the line as written.
+- `Status DBImpl::Get(...) {}` belongs to `DBImpl`: `methods` lists out-of-class
+  definitions (flagged) and in-class declarations without a definition in scope.
+  `impls` follows `: public Base`.
+- `#include "x.h"` resolves beside the includer first, then by path suffix, so
+  `cycles` sees include loops.
+
+### Grammar gaps masked on error lines
+
+Same-length masks, kept only when they lower the error count:
+
+| Language | Syntax the grammar rejects | Mask |
+|---|---|---|
+| TypeScript | variance annotations `<in T>`, `<out O>`, `<in out I>` (TS 4.7) | keyword blanked |
+| CSS | fractional keyframe selector `6.5% {` | `65% {` |
+| Bash | `&`, `<`, `>` in `${x//pat/rep}`; `$` offset in `${x:$i:1}` | character replaced |
+| C, C++ | see C and C++ above | macro blanked |
+
+Still not parsed: Lua's `cast(int *, ud)`-style type-argument macros and other
+macros whose expansion changes syntax; PowerShell gaps above; `[[ (a || b) ]]`
+grouping in Bash.
 
 ### Kotlin
 

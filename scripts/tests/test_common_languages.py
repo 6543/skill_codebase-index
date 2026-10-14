@@ -170,7 +170,8 @@ class PowerShellTest(Case):
         self.assertIn("main.ps1:6", out)  # get-thing -name foo
         self.assertIn("main.ps1:7", out)  # inside the Start-Job script block
         self.assertIn("Things.psm1:16", out)  # inside Worker.Run
-        self.assertNotIn("UNRESOLVED", out)
+        rows = out.split("\n\n")[0]  # the legend below names every label
+        self.assertNotIn("UNRESOLVED", rows)
 
     def test_member_invocation_is_a_call(self):
         out = self.run_cmd("refs", "Helper")
@@ -336,6 +337,93 @@ SITE_CSS = """
 
 #top-nav a:hover { animation: fade-in 1s; }
 """
+
+
+class PhpTest(Case):
+    """PHP joined the bundled profile: method calls keep their receiver."""
+
+    def setUp(self):
+        super().setUp()
+        self.write(
+            "src/Contracts/RouteInterface.php",
+            """<?php
+            namespace App\\Contracts;
+
+            interface RouteInterface
+            {
+                /** Run the route. */
+                public function run(): string;
+            }
+            """,
+        )
+        self.write(
+            "src/Routing/Route.php",
+            """<?php
+            namespace App\\Routing;
+
+            use App\\Contracts\\RouteInterface;
+
+            class Route implements RouteInterface
+            {
+                private Store $store;
+
+                public function run(): string
+                {
+                    $this->prepare();
+                    $this->store->save();
+                    $other->save();
+                    return self::make();
+                }
+
+                public function prepare(): void {}
+
+                public static function make(): string { return ""; }
+            }
+            """,
+        )
+        self.write(
+            "src/Routing/Store.php",
+            "<?php\nnamespace App\\Routing;\n\nclass Store { public function save(): void {} }\n",
+        )
+        self.write(
+            "src/Cache.php",
+            "<?php\nnamespace App;\n\nclass Cache { public function save(): void {} }\n",
+        )
+
+    def test_this_call_is_extracted(self):
+        out = self.run_cmd("trace", "run")
+        self.assertIn("-> Route.prepare", out)
+        self.assertIn("EXTRACTED", out)
+
+    def test_typed_property_selects_its_class(self):
+        out = self.run_cmd("trace", "run")
+        self.assertIn("-> Store.save", out)
+        self.assertNotIn("-> Cache.save", out)
+
+    def test_untyped_variable_receiver_draws_no_edge(self):
+        out = self.run_cmd("refs", "save")
+        row = [ln for ln in out.splitlines() if "$other->save" in ln][0]
+        self.assertNotIn("INFERRED", row)
+        self.assertNotIn("EXTRACTED", row)
+
+    def test_self_static_call_resolves_in_class(self):
+        self.assertIn("-> Route.make", self.run_cmd("trace", "run"))
+
+    def test_impls_uses_the_implements_clause(self):
+        out = self.run_cmd("impls", "RouteInterface")
+        self.assertIn("Route", out)
+        self.assertIn("declared", out)
+
+    def test_namespace_use_resolves_to_the_psr4_file(self):
+        self.write(
+            "src/Contracts/Loop.php",
+            "<?php\nnamespace App\\Contracts;\n\nuse App\\Routing\\Back;\n\ninterface Loop {}\n",
+        )
+        self.write(
+            "src/Routing/Back.php",
+            "<?php\nnamespace App\\Routing;\n\nuse App\\Contracts\\Loop;\n\nclass Back {}\n",
+        )
+        self.assertIn("import cycle(s)", self.run_cmd("cycles"))
 
 
 class HtmlTest(Case):

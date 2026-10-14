@@ -96,7 +96,9 @@ JAVASCRIPT = LangSpec(
     types=("class_declaration",),
     members=("field_definition", "public_field_definition"),
     consts=("lexical_declaration", "variable_declaration"),
-    imports=("import_statement",),
+    # `require('./x')` and `export ... from './x'` load modules too.
+    imports=("import_statement", "export_statement", "call_expression"),
+    import_hook="js_import",
     name_hook="js_assigned",
 )
 
@@ -126,7 +128,8 @@ TYPESCRIPT = LangSpec(
         "field_definition",
     ),
     consts=("lexical_declaration", "variable_declaration"),
-    imports=("import_statement",),
+    imports=JAVASCRIPT.imports,
+    import_hook="js_import",
     name_hook="js_assigned",
 )
 
@@ -141,6 +144,7 @@ TSX = LangSpec(
     members=TYPESCRIPT.members,
     consts=TYPESCRIPT.consts,
     imports=TYPESCRIPT.imports,
+    import_hook="js_import",
     name_hook="js_assigned",
 )
 
@@ -262,8 +266,10 @@ PHP = LangSpec(
     calls=(
         "function_call_expression",
         "member_call_expression",
+        "nullsafe_member_call_expression",
         "scoped_call_expression",
     ),
+    call_hook="php_call",
 )
 
 C = LangSpec(
@@ -326,6 +332,7 @@ FISH = LangSpec(
     imports=("command",),
     import_hook="shell_source",
     calls=("command",),
+    call_hook="fish_call",
     doc_hook="fish_description",
     unsupported=_SHELL_UNSUPPORTED,
     unsupported_reason=_SHELL_REASON,
@@ -437,6 +444,7 @@ VUE = LangSpec(
     members=TYPESCRIPT.members,
     consts=TYPESCRIPT.consts,
     imports=TYPESCRIPT.imports,
+    import_hook="js_import",
     name_hook="js_assigned",
     sfc="script",
 )
@@ -452,6 +460,7 @@ SVELTE = LangSpec(
     members=TYPESCRIPT.members,
     consts=TYPESCRIPT.consts,
     imports=TYPESCRIPT.imports,
+    import_hook="js_import",
     name_hook="js_assigned",
     sfc="script",
 )
@@ -522,13 +531,15 @@ NIX = LangSpec(
     defs=("binding",),
     types=(),
     consts=("inherit", "inherit_from"),
-    imports=("apply_expression",),
+    # `import ./x`, `callPackage ./pkg.nix`, `imports = [ ./mod.nix ]`: path
+    # literals are the edges between Nix files (see nix_path_refs).
+    imports=("apply_expression", "path_expression"),
     # In Nix, `pkgs.foo` is attribute access rather than a call, and that is how
     # values are referenced. Treating select alongside apply makes `refs` answer
     # "where is this used", which is the question that has an answer in a purely
     # functional language with no call/reference distinction.
-    calls=("apply_expression", "select_expression"),
-    ref_nodes=("select_expression",),
+    calls=("apply_expression", "select_expression", "path_expression"),
+    ref_nodes=("select_expression", "path_expression"),
     name_hook="nix_attrpath",
     import_hook="nix_import",
     top_level_only=True,
@@ -617,7 +628,6 @@ SKIP_DIRS = {
     ".hg",
     ".svn",
     "node_modules",
-    "vendor",
     "target",
     "dist",
     "build",
@@ -655,6 +665,38 @@ LOCKFILES = frozenset(
 # languages name tests FooTest/FooTests; see is_test().
 TEST_PATTERNS = ("_test.", ".test.", ".tests.", ".spec.", "_spec.")
 TEST_PREFIXES = ("test_", "tests_")
+# Directories that hold tests whatever their files are called: Rust's
+# `tests/`, Maven's `src/test/`, Jest's `__tests__/`, Go's `testdata/`.
+# Matched against path components below the scanned root only.
+TEST_DIRS = frozenset(
+    {
+        "test",
+        "tests",
+        "__tests__",
+        "spec",
+        "specs",
+        "testdata",
+        "fixtures",
+        "__fixtures__",
+        "e2e",
+    }
+)
+# Third-party code committed to the repo. Excluded by default because it
+# dominates counts (a 4,000-definition minified yarn plugin was the "densest
+# file" of one repo), but kept reachable with --vendored.
+VENDORED_DIRS = frozenset(
+    {
+        "vendor",
+        "third_party",
+        "third-party",
+        "bower_components",
+        "jspm_packages",
+        ".yarn",
+    }
+)
+# A minified file is one or a few enormous lines. Above this average line
+# length (over the first 64 KiB) a file is treated as minified.
+MINIFIED_LINE_LENGTH = 500
 MOCK_PATTERNS = ("mock_", "/mocks/", "_mock.", ".mock.")
 TODO_MARKERS = ("TODO", "FIXME", "HACK", "XXX", "BUG:", "NOTE:")
 

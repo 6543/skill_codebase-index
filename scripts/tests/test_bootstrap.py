@@ -115,7 +115,9 @@ class InventoryContractTest(unittest.TestCase):
         for root, dirs, files in os.walk(SKILL):
             dirs[:] = [d for d in dirs if d != "__pycache__"]
             for name in dirs + files:
-                with self.subTest(path=os.path.relpath(os.path.join(root, name), SKILL)):
+                with self.subTest(
+                    path=os.path.relpath(os.path.join(root, name), SKILL)
+                ):
                     self.assertRegex(name, r"^[A-Za-z0-9._-]+$")
 
     def test_manifest_built_from_another_inventory_is_refused(self):

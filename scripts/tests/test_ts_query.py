@@ -246,8 +246,9 @@ class RefsTest(Case):
         self.assertIn("EXTRACTED", self.run_cmd("refs", "run"))
 
     def test_two_plausible_declarations_are_labelled_ambiguous(self):
-        self.write("a/one.go", "package a\nfunc Poll() {}\n")
-        self.write("b/two.go", "package b\nfunc Poll() {}\n")
+        # Methods: a Go method call cannot reach a free function.
+        self.write("a/one.go", "package a\ntype A struct{}\nfunc (a *A) Poll() {}\n")
+        self.write("b/two.go", "package b\ntype B struct{}\nfunc (b *B) Poll() {}\n")
         self.write("c/call.go", "package c\nfunc Use() { x.Poll() }\n")
         out = self.run_cmd("refs", "Poll")
         self.assertIn("AMBIGUOUS", out)

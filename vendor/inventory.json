@@ -40,7 +40,7 @@
   "profiles": {
     "common": [
       "go", "rust", "javascript", "typescript", "tsx", "vue", "nix", "python", "java",
-      "sql", "bash", "fish", "c", "c_sharp", "cpp", "powershell", "html", "css"
+      "sql", "bash", "fish", "c", "c_sharp", "cpp", "powershell", "html", "css", "php"
     ],
     "all": [
       "go", "rust", "javascript", "typescript", "tsx", "vue", "svelte", "nix", "python",

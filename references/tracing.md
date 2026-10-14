@@ -35,11 +35,23 @@ Stop at first pass that answer the question. Most never reach pass three.
 | `INFERRED` | one candidate survived ranking, in another file | "appears to call", worth one check |
 | `reference` | names a table, attribute, custom property or link without calling it | "refers to", never "calls" |
 | `AMBIGUOUS` | several survived (`refs` only) | a list, never a conclusion |
+| `UNRESOLVED` / `receiver` | a method called on a value whose type is not written down (`ctx.Err()`, `y.Save()` after `y := x.Make()`), outside the repo (`ctx context.Context`), or a link to a missing file | "calls *some* `Err`"; the candidates are only names |
+| `LOCAL` | a lambda parameter or local binding (Nix), not a declaration | "uses its argument" |
 | `dispatch` | the name is an interface member | "one of these implementations" |
 | `dynamic` | shell command name built at runtime (`$cmd`, `_item_$x`) | "calls something chosen at runtime"; read the code |
 | absent | nothing matched | unknown, not "nothing calls it" |
 
-Last row is the one that misleads. Empty `refs`, or leaf node in `trace`, means
+A qualified call is judged by its receiver before its name. `this`/`self`/the
+Go receiver means the enclosing type; an imported repo module or package means
+its free functions; a type name means its static members; a local whose type is
+written in the function (`s Store`, `s: Store`, `s := &Store{}`, `s = new
+Store()`, `Store s`) or a field of a typed receiver (`o.inner.Poll()`) means
+that type's methods. A type outside the repo (`context.Context`, `Vec`) draws no
+edge. Anything else is a receiver of unknown type: no edge, the candidates are
+listed. A method call never resolves to a free function in a language where that
+is impossible (Go, Rust, Java, C#, Python, ...).
+
+Last row of the table is the one that misleads. Empty `refs`, or leaf node in `trace`, means
 no *syntactic* caller found. Framework routing, reflection, generated clients and
 template bindings all produce callers leaving no matching name in source.
 
@@ -48,6 +60,7 @@ template bindings all produce callers leaving no matching name in source.
 | Blind spot | How it shows up | What actually settles it |
 |---|---|---|
 | Interface dispatch | `dispatch` in the unresolved block | language server: implementations of the method |
+| Receiver of unknown type | `receiver` in the unresolved block | the declaration of the variable, or a language server |
 | Callback registration | a `callback` edge, or no caller at all | read the registrar; find where it invokes what it stored |
 | Async work | `effects --kind=spawn` | read the join, the cancellation path, and who owns the error |
 | Channel handoff | `effects --kind=channel` | buffer size, `select`, close, timeout, and who reads next |

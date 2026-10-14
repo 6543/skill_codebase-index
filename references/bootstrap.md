@@ -71,7 +71,7 @@ Home directory: `--home`, else `$CODEBASE_INDEX_HOME`, else
 
 | Flag | Meaning |
 |---|---|
-| `--profile common\|all` | `common`: the 18 bundled surfaces. `all`: adds Kotlin, Swift, Scala, Ruby, PHP, Lua, Zig, Julia, Svelte (PyPI) |
+| `--profile common\|all` | `common`: the 19 bundled surfaces (PHP included). `all`: adds Kotlin, Swift, Scala, Ruby, Lua, Zig, Julia, Svelte (PyPI) |
 | `--languages a,b` | exactly these (plus the runtime); overrides `--profile` |
 | `--offline` | never contact a package index; fail naming anything the bundle lacks |
 | `--python PATH` | build the environment from this interpreter |

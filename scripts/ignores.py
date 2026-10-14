@@ -126,10 +126,16 @@ def walk(root, on_dir_rules=None):
     Yields (dirpath, filenames) with ignored entries already removed. The `.git`
     directory is always pruned: it is never source and is not always listed in
     the repo's own ignore file.
+
+    Rules are matched on absolute paths, but `dirpath` keeps the form *root* was
+    given in (relative stays relative), so every path the caller prints reads
+    the same way the user typed it.
     """
+    given = os.path.normpath(root)
     root = os.path.abspath(root)
     inherited = {root: load_rules(root)}
     for dirpath, dirnames, filenames in os.walk(root):
+        shown = os.path.normpath(os.path.join(given, os.path.relpath(dirpath, root)))
         rules = inherited.get(dirpath, [])
         own = load_rules(dirpath) if dirpath != root else []
         if own:
@@ -154,7 +160,7 @@ def walk(root, on_dir_rules=None):
             for name in filenames
             if not is_ignored(os.path.join(dirpath, name), False, rules)
         ]
-        yield dirpath, kept_files
+        yield shown, kept_files
 
 
 def matches_any(name, patterns):

@@ -27,6 +27,7 @@ Commands
 Filters (any command taking <root>)
   --tests          include test files (default: excluded)
   --mocks          include generated mocks and generated code (default: excluded)
+  --vendored       include vendored dirs (vendor/, third_party/, .yarn/) and minified files
   --lang=<key>     restrict to one language (see `langs`)
   --json           machine-readable output
   --no-gitignore   do not read .gitignore files
@@ -90,28 +91,41 @@ from languages import (
     ARGUMENT_NODES,
     BY_EXT,
     BY_KEY,
-    CSS,
-    JAVASCRIPT,
-    SHEBANG_INTERPRETERS,
-    TYPESCRIPT,
     CONTRACT_NODES,
+    CSS,
     DECISION_NODES,
     DECISION_OPERATORS,
     GENERATED_MARKERS,
+    JAVASCRIPT,
     LOCKFILES,
+    MINIFIED_LINE_LENGTH,
     MOCK_PATTERNS,
     REFERENCE_NODES,
     SENSITIVE_NAMES,
     SENSITIVE_PREFIXES,
     SENSITIVE_SUFFIXES,
     SERIALIZATION_CALLEES,
+    SHEBANG_INTERPRETERS,
     SKIP_DIRS,
     SPAWN_CALLEES,
     SPAWN_NODES,
+    TEST_DIRS,
     TEST_PATTERNS,
     TEST_PREFIXES,
     TODO_MARKERS,
+    TYPESCRIPT,
+    VENDORED_DIRS,
     canonical_key,
+)
+from receivers import (
+    METHODS_ONLY,
+    RECEIVER_LANGS,
+    SELF_RECEIVERS,
+    declaration_positions,
+    normalise_type,
+    segments,
+    split_receiver,
+    type_matches,
 )
 
 # Parse results are cached for the lifetime of this process only. Several
@@ -322,14 +336,23 @@ def _parse_uncached(path):
         if parser is None or not src.strip():
             continue
         spec = seg_spec
-        tree = parser.parse(src)
-        errors = count_real_errors(tree.root_node, src, spec)
+        parse_src = _premask_c_exports(src) if spec.key in ("c", "cpp") else src
+        tree = parser.parse(parse_src)
+        errors = count_real_errors(tree.root_node, parse_src, spec)
         if errors and spec.key == "go":
             tree, errors = _reparse_go_new(parser, src, tree, errors, spec)
         if errors and spec.key == "css":
             tree, errors = _reparse_css_at_rules(parser, src, tree, errors, spec)
         if errors and spec.key == "sql":
             tree, errors = _reparse_plpgsql(parser, src, tree, errors, spec)
+            if errors:
+                tree, errors, how = _recover_sql(parser, src, tree, errors, spec)
+                if how:
+                    _SQL_RECOVERED.setdefault(path, []).append((offset + 1, how))
+        if errors and spec.key in _MASKERS:
+            tree, errors = _reparse_masked(
+                parser, parse_src, tree, errors, spec, _MASKERS[spec.key]
+            )
         if errors:
             _PARSE_ERRORS.add(path)
         out.append((src, tree, spec, offset))
@@ -537,6 +560,8 @@ _PLPGSQL_CONTROL = [
         rb"^[ \t]*FOR(?:EACH)?[ \t]+[^;\n]*?[ \t]IN\b",
         rb"^[ \t]*WHILE\b[^;]*?\bLOOP\b",
         rb"^[ \t]*[\w.]+[ \t]*:=[^;]*;",
+        # `NEW.updated_at = now();`: PL/pgSQL also assigns with `=`.
+        rb"^[ \t]*[\w.]+[ \t]*=(?!=)[^;]*;",
         rb"\bINTO[ \t]+(?:STRICT[ \t]+)?[\w.]+(?:[ \t]*,[ \t]*[\w.]+)*(?=\s+FROM\b)",
     )
 ]
@@ -566,6 +591,266 @@ def _reparse_plpgsql(parser, src, tree, errors, spec):
     return (retry, retry_errors) if retry_errors < errors else (tree, errors)
 
 
+# --------------------------------------------------------------------------
+# masked re-parses for syntax a grammar rejects
+# --------------------------------------------------------------------------
+#
+# Every mask below replaces bytes with bytes of the same length (usually
+# spaces), so offsets and line numbers do not move, and `decl` prints from the
+# original source. A mask is applied only on lines next to an ERROR node, and
+# kept only when the re-parse has fewer errors than before.
+
+
+def _error_lines(tree):
+    """Line indexes covered by ERROR/MISSING nodes, one line of margin."""
+    lines = set()
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            lines.update(range(max(0, node.start_point[0] - 1), node.end_point[0] + 2))
+            continue
+        if node.has_error:
+            stack.extend(node.children)
+    return lines
+
+
+def _blank_group(match, group):
+    """The match with one group replaced by spaces of the same length."""
+    start, end = match.span(group)
+    whole = match.group(0)
+    offset = match.start(0)
+    return whole[: start - offset] + b" " * (end - start) + whole[end - offset :]
+
+
+def _mask_lines(src, lines, maskers):
+    out = src.split(b"\n")
+    for index in sorted(lines):
+        if index < len(out):
+            line = out[index]
+            for masker in maskers:
+                line = masker(line)
+            out[index] = line
+    return b"\n".join(out)
+
+
+def _reparse_masked(parser, src, tree, errors, spec, maskers, rounds=3):
+    """-> (tree, errors) after masking error lines, if that helped."""
+    best_tree, best_errors, current = tree, errors, src
+    for _ in range(rounds):
+        masked = _mask_lines(current, _error_lines(best_tree), maskers)
+        if masked == current:
+            break
+        retry = parser.parse(masked)
+        found = count_real_errors(retry.root_node, masked, spec)
+        if found >= best_errors:
+            break
+        best_tree, best_errors, current = retry, found, masked
+        if not found:
+            break
+    return best_tree, best_errors
+
+
+# TypeScript 4.7 variance annotations (`<in T>`, `<out O>`, `<in out I>`) are
+# newer than tree_sitter_typescript 0.23.2.
+_TS_VARIANCE = re.compile(
+    rb"(?:(?<=[<,])|^)\s*((?:in\s+out|in|out)\s+)(?=[A-Za-z_$][\w$]*\s*(?:extends\b|=|,|>|$))"
+)
+
+
+def _mask_ts_variance(line):
+    return _TS_VARIANCE.sub(lambda m: _blank_group(m, 1), line)
+
+
+# C/C++ attribute-like macros the grammar cannot see through, without a
+# preprocessor: `class LEVELDB_EXPORT DB {`, `LUA_API int f(...)`,
+# `void f() EXCLUSIVE_LOCKS_REQUIRED(mu_);`, `int x GUARDED_BY(mu);`.
+_C_EXPORT_MACRO = re.compile(
+    rb"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:EXPORT|API|EXTERN|DLL|PUBLIC|DECL|DEPRECATED)\w*\b"
+)
+_C_CLASS_MACRO = re.compile(
+    rb"\b(?:class|struct|union)\s+([A-Z][A-Z0-9_]{2,})\s+(?=[A-Za-z_]\w*\s*(?:[:{;]|final\b|$))"
+)
+_C_LEADING_MACRO = re.compile(
+    rb"^\s*([A-Z][A-Z0-9_]{2,})\s+(?=[A-Za-z_][^;=(){}]*?\(?\s*[*&]?\s*[A-Za-z_~][\w:]*\s*\)?\s*\()"
+)
+_C_TRAILING_MACRO = re.compile(
+    rb"([A-Z][A-Z0-9_]{2,}\([^()]*\))(?=\s*(?:;|\{|=|,|override\b|const\b|final\b|$))"
+)
+
+
+def _premask_c_exports(src):
+    """`LUA_API`, `LEVELDB_EXPORT`: blank export/API macros outside `#` lines.
+
+    These expand to visibility attributes or nothing, never to a type, so
+    removing them always yields what the compiler sees. Done before the first
+    parse: a macro in a return type position often parses *without* an error,
+    as the type, which no error-driven mask would catch.
+    """
+    if not _C_EXPORT_MACRO.search(src):
+        return src
+    out = []
+    for line in src.split(b"\n"):
+        if not line.lstrip().startswith(b"#"):
+            line = _C_EXPORT_MACRO.sub(lambda m: b" " * len(m.group(0)), line)
+        out.append(line)
+    return b"\n".join(out)
+
+
+def _mask_c_macros(line):
+    if line.lstrip().startswith(b"#"):
+        return line
+    line = _C_CLASS_MACRO.sub(lambda m: _blank_group(m, 1), line)
+    line = _C_LEADING_MACRO.sub(lambda m: _blank_group(m, 1), line)
+    return _C_TRAILING_MACRO.sub(lambda m: _blank_group(m, 1), line)
+
+
+# tree-sitter-css rejects a fractional keyframe selector (`6.5% {`).
+_CSS_FRACTION = re.compile(rb"(\d+)\.(\d+)%")
+
+
+_CSS_KEYFRAME_SELECTOR = re.compile(
+    rb"^\s*(?:\d+(?:\.\d+)?%\s*,\s*)*\d+(?:\.\d+)?%\s*(?:\{|,|$)"
+)
+
+
+def _mask_css_fraction(line):
+    if not _CSS_KEYFRAME_SELECTOR.match(line):
+        return line
+    return _CSS_FRACTION.sub(lambda m: m.group(1) + m.group(2) + b"% ", line)
+
+
+# tree-sitter-bash rejects `&`, `<`, `>` inside a pattern substitution
+# (`${1//&/\&amp;}`) and a `$` offset in a substring (`${name:$i:1}`).
+_BASH_EXPANSION = re.compile(rb"\$\{([^{}\n]*)\}")
+
+
+def _mask_bash_expansion(line):
+    def fix(match):
+        inner = match.group(1)
+        if b"//" in inner or b"/" in inner[1:]:
+            inner = re.sub(rb"[&<>|;]", b"_", inner)
+        if b":" in inner:
+            head, _, tail = inner.partition(b":")
+            inner = head + b":" + tail.replace(b"$", b" ")
+        return b"${" + inner + b"}"
+
+    return _BASH_EXPANSION.sub(fix, line)
+
+
+_MASKERS = {
+    "typescript": (_mask_ts_variance,),
+    "tsx": (_mask_ts_variance,),
+    "vue": (_mask_ts_variance,),
+    "svelte": (_mask_ts_variance,),
+    "c": (_mask_c_macros,),
+    "cpp": (_mask_c_macros,),
+    "css": (_mask_css_fraction,),
+    "bash": (_mask_bash_expansion,),
+}
+
+
+# SQL: pg_dump and hand-written PostgreSQL that the grammar rejects even after
+# the PL/pgSQL mask. Function attribute lines, OPERATOR(schema.op) and, as a
+# last resort, the whole body of a function: the declaration is kept, the
+# references inside the body are lost (and reported).
+_SQL_FUNCTION_CLAUSE = re.compile(
+    rb"(?im)^[ \t]*(?:SET[ \t]+[\w.]+[ \t]+(?:TO|=)[^\n]*|SECURITY[ \t]+(?:DEFINER|INVOKER)"
+    rb"|(?:NOT[ \t]+)?LEAKPROOF|STRICT|IMMUTABLE|STABLE|VOLATILE|PARALLEL[ \t]+\w+"
+    rb"|COST[ \t]+\d+|ROWS[ \t]+\d+|CALLED[ \t]+ON[ \t]+NULL[ \t]+INPUT"
+    rb"|RETURNS[ \t]+NULL[ \t]+ON[ \t]+NULL[ \t]+INPUT)[ \t]*$"
+)
+_SQL_OPERATOR = re.compile(rb"OPERATOR\(([^()]*)\)")
+# A parameter named like a keyword the grammar reserves (`name text`). Blanked,
+# it leaves an unnamed parameter, which PostgreSQL accepts; decl prints the
+# original.
+_SQL_KEYWORD_PARAM = re.compile(
+    rb"(?i)(?<=[(,])(\s*)(name|type|key|value|data|role|user|version|position|level|action|comment|owner|status)(?=\s+[\w.\"]+(?:\s*\[\])?\s*(?:DEFAULT\b[^,)]*)?[,)])"
+)
+# `b public.citext DEFAULT NULL::public.citext` in a parameter list.
+_SQL_PARAM_DEFAULT = re.compile(
+    rb"(?i)\bDEFAULT\s+(?:NULL|'[^'\n]*'|-?\d+(?:\.\d+)?|true|false)(?:::[\w.\"]+(?:\[\])?)?(?=\s*[,)])"
+)
+_SQL_ROUTINE = re.compile(
+    rb"(?is)^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b"
+)
+
+# Per file: [(line, how)] for statements that needed more than the grammar.
+_SQL_RECOVERED = {}
+
+
+def _with_statement(body):
+    """The grammar rejects a routine body with no statement in it, which is
+    what masking leaves of `begin NEW.x = now(); return NEW; end;`. Write a
+    same-length `select 1;` over the first line long enough to hold it."""
+    if re.sub(rb"(?i)\bbegin\b|\bend\b|[;\s]", b"", body):
+        return body
+    filler = b"select 1;"
+    position = 0
+    for line in body.split(b"\n"):
+        if len(line) >= len(filler):
+            return body[:position] + filler + body[position + len(filler) :]
+        position += len(line) + 1
+    return body
+
+
+def _recover_sql(parser, src, tree, errors, spec):
+    """-> (tree, errors, how) where *how* is '', 'masked' or 'body skipped'.
+
+    Both attempts start from the statement with its rejected header syntax
+    blanked (function attribute lines, OPERATOR(...), parameter defaults):
+    first with PL/pgSQL control flow masked so the queries in the body are
+    still read, then, if that is not enough, with the body blanked entirely.
+    """
+    base = _SQL_FUNCTION_CLAUSE.sub(_blank, src)
+    base = _SQL_OPERATOR.sub(lambda m: b"=" + b" " * (len(m.group(0)) - 1), base)
+    routine = _SQL_ROUTINE.match(base) is not None
+    if routine:
+        base = _SQL_PARAM_DEFAULT.sub(_blank, base)
+    how = ""
+    attempts = [
+        (
+            "masked",
+            _PLPGSQL_BODY.sub(
+                lambda m: (
+                    m.group(1) + _with_statement(_mask_plpgsql(m.group(2))) + m.group(1)
+                ),
+                base,
+            ),
+        )
+    ]
+    if routine:
+        attempts.append(
+            (
+                "body skipped",
+                _PLPGSQL_BODY.sub(
+                    lambda m: (
+                        m.group(1)
+                        + _with_statement(re.sub(rb"[^\n]", b" ", m.group(2)))
+                        + m.group(1)
+                    ),
+                    base,
+                ),
+            )
+        )
+        attempts.append(
+            (
+                "body skipped",
+                _SQL_KEYWORD_PARAM.sub(
+                    lambda m: m.group(1) + b" " * len(m.group(2)), attempts[-1][1]
+                ),
+            )
+        )
+    for label, candidate in attempts:
+        if candidate == src or not errors:
+            continue
+        retry = parser.parse(candidate)
+        found = count_real_errors(retry.root_node, candidate, spec)
+        if found < errors:
+            tree, errors, how = retry, found, label
+    return tree, errors, how
+
+
 def _harmless_nix_comma(node, src):
     if node.type != "identifier":
         return False
@@ -590,7 +875,9 @@ def field(node, name):
 
 
 def line_of(src, node, offset=0):
-    return src[: node.start_byte].count(b"\n") + 1 + offset
+    """1-based line of *node* in the file. Masked re-parses replace bytes with
+    bytes of the same length and keep newlines, so the tree's row is exact."""
+    return node.start_point[0] + 1 + offset
 
 
 def walk(node, types):
@@ -972,9 +1259,13 @@ def signature(node, spec):
     return "".join(parts).strip().replace("\n", " ")
 
 
-def doc_comment(node, spec):
-    """Contiguous comments directly above a declaration, or a Python docstring."""
-    if spec.name_hook == "python_doc":
+def doc_comment(node, spec, docstring=True):
+    """Contiguous comments directly above a declaration, or a Python docstring.
+
+    `decl` passes docstring=False: it prints the body, which holds the
+    docstring already, and printing it twice read as two different texts.
+    """
+    if spec.name_hook == "python_doc" and docstring:
         body = node.child_by_field_name("body")
         if body is not None and body.named_child_count:
             first = body.named_children[0]
@@ -1015,7 +1306,7 @@ def doc_comment(node, spec):
         # wrapper, so it is invisible from the inner node. Only a wrapper opening
         # on the same line, with this node as its first child, is followed, so
         # this cannot walk out of a block and steal an unrelated comment.
-        return doc_comment(node.parent, spec)
+        return doc_comment(node.parent, spec, docstring)
     if spec.doc_hook == "fish_description":
         return list(reversed(out)) + _fish_description(node)
     return list(reversed(out))
@@ -1042,6 +1333,26 @@ def _fish_description(node):
     return []
 
 
+_ANONYMOUS_BODIES = frozenset({"class_body", "declaration_list"})
+_ANONYMOUS_HOSTS = frozenset(
+    {
+        "object_creation_expression",
+        "anonymous_object_creation_expression",
+        "object_literal",
+    }
+)
+
+
+def is_method_prototype(node, spec):
+    """C++ `Status Get(int k) override;` inside a class body: a method declared
+    there and defined elsewhere (or pure virtual)."""
+    return (
+        spec.name_hook == "c_declarator"
+        and node.type == "field_declaration"
+        and any(n.type == "function_declarator" for n in _c_declarator_chain(node))
+    )
+
+
 def receiver_type(node, spec):
     """Bare type name a method is attached to; '' for free functions."""
     if spec.key == "go":
@@ -1054,10 +1365,26 @@ def receiver_type(node, spec):
                 return text(typ).lstrip("*&")
         return ""
 
+    if spec.name_hook == "c_declarator":
+        # `Status DBImpl::Get(...) {}`: defined outside the class, owned by it.
+        for link in _c_declarator_chain(node):
+            if link.type == "qualified_identifier":
+                scope = link.child_by_field_name("scope")
+                if scope is not None:
+                    return re.split(r"<", text(scope))[0].split("::")[-1]
+
     # Otherwise: nearest enclosing type declaration (class body, impl block).
     owners = set(spec.types) | set(spec.impl_blocks)
     cur = node.parent
     while cur is not None:
+        if (
+            cur.type in _ANONYMOUS_BODIES
+            and cur.parent is not None
+            and (cur.parent.type in _ANONYMOUS_HOSTS)
+        ):
+            # `new Factory() { create() {} }`: a member of an anonymous
+            # class, not of the class whose field holds it.
+            return ""
         if cur.type in owners:
             if cur.type in spec.impl_blocks:
                 return field(cur, "type").lstrip("*&")
@@ -1113,7 +1440,9 @@ def members_of(node, spec, src, offset):
         doc = doc_comment(child, spec)
         # CSS declarations are both members of a rule and, when custom
         # properties, definitions. Inside a rule they read as members.
-        if child.type in spec.defs and child.type not in spec.members:
+        if (
+            child.type in spec.defs and child.type not in spec.members
+        ) or is_method_prototype(child, spec):
             out.append(("method", signature(child, spec), doc, line))
         else:
             rendered = " ".join(text(child).split())
@@ -1130,12 +1459,22 @@ _CLASS_TEST = re.compile(r"[a-z0-9_](?:Test|Tests)$")  # JsonParserTest, StoreTe
 
 
 def is_test(path):
+    """Test by file name. Test directories are judged by iter_files, relative
+    to the scanned root, so a repo checked out under `/tests/` is not all test.
+    """
     base = os.path.basename(path)
     lowered = base.lower()
     return (
         lowered.startswith(TEST_PREFIXES)
         or any(p in lowered for p in TEST_PATTERNS)
         or _CLASS_TEST.search(base.split(".")[0]) is not None
+    )
+
+
+def is_test_candidate(path):
+    """For ranking only: by name, or by a test directory anywhere in the path."""
+    return is_test(path) or bool(
+        set(os.path.normpath(path).split(os.sep)[:-1]) & TEST_DIRS
     )
 
 
@@ -1175,8 +1514,41 @@ def is_generated(path, head_bytes=2048):
 # costs seconds and its declarations are never the answer to the question.
 _MAX_BYTES = 2_000_000
 
+# Files the default filters left out, by reason, for `map` to report. Reset at
+# the start of every command.
+_EXCLUDED = {}
+
+
+def is_minified(path, sample=65536):
+    """`*.min.js`, or a file whose lines average more than a screenful."""
+    if ".min." in os.path.basename(path).lower():
+        return True
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(sample)
+    except OSError:
+        return False
+    if len(head) < 1000:
+        return False
+    return len(head) / (head.count(b"\n") + 1) > MINIFIED_LINE_LENGTH
+
+
+# One listing per root and filter set for the lifetime of a command: a trace
+# makes several passes, and each pass re-reading .gitignore files and sniffing
+# file headers cost more than parsing. Cleared by run_command.
+_FILES_CACHE = {}
+_FILE_OPTS = ("tests", "mocks", "vendored", "lang", "no_gitignore", "max_bytes")
+
 
 def iter_files(root, opts):
+    """Cached _iter_files: the same listing for every pass of one command."""
+    key = (root, tuple(str(opts.get(k)) for k in _FILE_OPTS))
+    if key not in _FILES_CACHE:
+        _FILES_CACHE[key] = list(_iter_files(root, opts))
+    return iter(_FILES_CACHE[key])
+
+
+def _iter_files(root, opts):
     """Yield source files under *root*, honouring .gitignore.
 
     A repo's own ignore file already encodes which paths are generated or
@@ -1200,11 +1572,13 @@ def iter_files(root, opts):
         else:
             dirpath, filenames = entry
 
-        parts = set(os.path.relpath(dirpath, root).split(os.sep))
+        parts = set(os.path.relpath(dirpath, root).split(os.sep)) - {"."}
         if parts & SKIP_DIRS:
             continue
         if not opts["mocks"] and "mocks" in parts:
             continue
+        vendored = not opts.get("vendored") and bool(parts & VENDORED_DIRS)
+        test_dir = not opts["tests"] and bool(parts & TEST_DIRS)
 
         for name in sorted(filenames):
             if name in LOCKFILES:
@@ -1219,14 +1593,23 @@ def iter_files(root, opts):
                 continue
             if opts["lang"] and spec.key != opts["lang"]:
                 continue
-            if not opts["tests"] and is_test(path):
+            if vendored:
+                _EXCLUDED.setdefault("vendored", set()).add(path)
+                continue
+            if test_dir or (not opts["tests"] and is_test(path)):
+                _EXCLUDED.setdefault("tests", set()).add(path)
                 continue
             if not opts["mocks"] and (is_mock(path) or is_generated(path)):
+                _EXCLUDED.setdefault("generated or mocks", set()).add(path)
                 continue
             try:
                 if os.path.getsize(path) > int(opts.get("max_bytes", _MAX_BYTES)):
+                    _EXCLUDED.setdefault("oversized", set()).add(path)
                     continue
             except OSError:
+                continue
+            if not opts.get("vendored") and is_minified(path):
+                _EXCLUDED.setdefault("minified", set()).add(path)
                 continue
             yield path
 
@@ -1319,6 +1702,11 @@ def cmd_map(root, opts, emit):
                 }
                 for k, v in stats.items()
             }
+            | {
+                "_excluded": {
+                    reason: len(paths) for reason, paths in _EXCLUDED.items() if paths
+                }
+            }
         )
         return
 
@@ -1353,6 +1741,17 @@ def cmd_map(root, opts, emit):
         for count, name in sorted(hubs, reverse=True)[:12]:
             path, line, _ = declared[name]
             emit(f"  {count:>4} files  {name}  ({os.path.relpath(path, root)}:{line})")
+    excluded = excluded_summary()
+    if excluded:
+        emit(f"\nexcluded by default: {excluded}")
+        emit("  (--tests, --vendored, --mocks or --max-bytes=<n> bring them back)")
+
+
+def excluded_summary():
+    """`tests 12, vendored 3, ...` for the files the default filters left out."""
+    return ", ".join(
+        f"{reason} {len(paths)}" for reason, paths in sorted(_EXCLUDED.items()) if paths
+    )
 
 
 def any_ancestor_is_def(node, spec):
@@ -1377,19 +1776,31 @@ def preview(node, maxlines=6, width=110):
     return head
 
 
+_CONST_WIDTH = 160
+_CONST_LINES = 12
+
+
 def render_const(node, spec):
     """Const groups list every value; a const holding a function body does not.
 
     An enum-style group is exactly what someone greps for, so it is worth the
     lines. `const handler = () => {...}` is a function in disguise and gets
-    collapsed instead.
+    collapsed instead. A huge literal (a 6 KB colour table) is cut to a line,
+    with its full length stated; `decl` prints it whole.
     """
     if any(walk(node, spec.defs)):
         return preview(node)
     lines = [ln.strip() for ln in text(node).split("\n") if ln.strip()]
-    if len(lines) == 1:
-        return lines[0]
-    return "\n" + "\n".join(f"        {ln}" for ln in lines)
+    shown = []
+    for line in lines[:_CONST_LINES]:
+        if len(line) > _CONST_WIDTH:
+            line = f"{line[: _CONST_WIDTH - 10]}... (+{len(line) - _CONST_WIDTH + 10} chars)"
+        shown.append(line)
+    if len(lines) > _CONST_LINES:
+        shown.append(f"... (+{len(lines) - _CONST_LINES} lines)")
+    if len(shown) == 1:
+        return shown[0]
+    return "\n" + "\n".join(f"        {ln}" for ln in shown)
 
 
 def cmd_outline(path, opts, emit):
@@ -1403,6 +1814,9 @@ def cmd_outline(path, opts, emit):
         emit(f"unsupported or unparseable: {path}")
         return
     host = spec_for(path)
+    if opts["json"]:
+        emit(outline_json(path, host, segments))
+        return
     for index, segment in enumerate(segments):
         _, _, spec, offset = segment
         if host.outline_hook == "html":
@@ -1420,14 +1834,44 @@ def cmd_outline(path, opts, emit):
             for title, lines in outline_sections(segment).items():
                 merged.setdefault(title, []).extend(lines)
         emit_sections(merged, emit)
-    if host.sfc:
-        with open(path, "rb") as handle:
-            if re.search(rb"<template[\s>]", handle.read()):
-                emit(
-                    "\n(template not analysed: only <script> blocks are parsed, so "
-                    "components, directives and bindings used in the template "
-                    "leave no edges)"
-                )
+    if host.sfc and _has_template(path):
+        emit(_TEMPLATE_NOTE)
+
+
+_TEMPLATE_NOTE = (
+    "\n(template not analysed: only <script> blocks are parsed, so "
+    "components, directives and bindings used in the template "
+    "leave no edges)"
+)
+
+
+def _has_template(path):
+    with open(path, "rb") as handle:
+        return re.search(rb"<template[\s>]", handle.read()) is not None
+
+
+def outline_json(path, host, segments):
+    """One object per file. Code regions are merged into one set of lists
+    (SQL statements, Vue script blocks); HTML and CSS keep their document
+    outline as lines, since elements and rules are not declarations."""
+    result = {"file": path, "language": host.key}
+    if host.outline_hook:
+        lines = []
+        for segment in segments:
+            _, _, spec, _ = segment
+            if spec.outline_hook:
+                _OUTLINE_HOOKS[spec.outline_hook](*segment, lines.append)
+        result["outline"] = [line for line in lines if line.strip()]
+    code = [s for s in segments if not s[2].outline_hook]
+    for segment in code:
+        for key, value in outline_data(segment).items():
+            if isinstance(value, list):
+                result.setdefault(key, []).extend(value)
+            else:
+                result[key] = value
+    if host.sfc and _has_template(path):
+        result["note"] = " ".join(_TEMPLATE_NOTE.split())
+    return result
 
 
 def type_heading(node, spec, kind):
@@ -1630,78 +2074,95 @@ def emit_sections(sections, emit):
             emit(line)
 
 
-def outline_sections(segment):
-    """-> {section title: [lines]} for one parsed region; "" holds the header.
+_NESTED_SCOPES = {
+    # A `use` inside `mod tests { }` or a function imports into that scope.
+    "rust": ("mod_item", "function_item", "impl_item", "trait_item"),
+}
 
-    Collected rather than printed so that a file parsed as several regions
-    (SQL, one statement each) still reads as one outline.
-    """
+
+def _nested_import(node, spec):
+    scopes = _NESTED_SCOPES.get(spec.key)
+    return bool(scopes) and any(a.type in scopes for a in _ancestors(node))
+
+
+def outline_data(segment):
+    """-> dict of lists describing one parsed region (see outline_sections)."""
     src, tree, spec, offset = segment
-    sections = {}
-
-    def add(title, line):
-        sections.setdefault(title, []).append(line)
-
+    data = {
+        "header": [],
+        "imports": [],
+        "types": [],
+        "impl_blocks": [],
+        "consts": [],
+        "prototypes": [],
+        "funcs": [],
+    }
     root_node = tree.root_node
 
     for node in walk(root_node, spec.module_decl):
-        header = text(node).split("\n")[0].split("{")[0].strip()
-        add("", header[:120])
+        data["header"].append(text(node).split("\n")[0].split("{")[0].strip()[:120])
         break
-
     for line in src.decode("utf8", "replace").split("\n")[:15]:
         stripped = line.strip()
         if stripped.startswith(("//go:build", "# type:")):
-            add("", f"buildtag {stripped}")
+            data["header"].append(f"buildtag {stripped}")
 
     for n in walk(root_node, spec.imports):
-        if is_import_node(n, spec):
-            add("imports", f"  {preview(n, maxlines=1, width=100)}")
+        if is_import_node(n, spec) and not _nested_import(n, spec):
+            data["imports"].append(preview(n, maxlines=1, width=100))
+
+    def member_rows(node):
+        return [
+            {"kind": mkind, "text": rendered, "doc": doc, "line": line}
+            for mkind, rendered, doc, line in members_of(node, spec, src, offset)
+        ]
 
     types = list(walk_decls(root_node, spec, spec.types))
     for node in types:
         kind = "interface" if node.type in spec.ifaces else node.type
-        for docline in doc_comment(node, spec):
-            add("types", f"    {docline}")
-        add(
-            "types", f"  {line_of(src, node, offset)}: {type_heading(node, spec, kind)}"
+        data["types"].append(
+            {
+                "line": line_of(src, node, offset),
+                "kind": kind,
+                "name": resolve_name(node, spec),
+                "heading": type_heading(node, spec, kind),
+                "extends": supertypes(node, spec),
+                "doc": doc_comment(node, spec),
+                "members": member_rows(node),
+            }
         )
-        for mkind, rendered, doc, _ in members_of(node, spec, src, offset):
-            for docline in doc:
-                add("types", f"        {docline}")
-            add("types", f"        {'fn' if mkind == 'method' else '  '} {rendered}")
 
     # Rust puts methods in `impl` blocks, apart from the type. Without this
     # section they were owned by no listed container and vanished.
     for node in walk(root_node, spec.impl_blocks):
         trait = field(node, "trait")
-        header = (
-            f"impl {trait} for {field(node, 'type')}"
-            if trait
-            else f"impl {field(node, 'type')}"
+        data["impl_blocks"].append(
+            {
+                "line": line_of(src, node, offset),
+                "type": field(node, "type"),
+                "trait": trait,
+                "heading": f"impl {trait} for {field(node, 'type')}"
+                if trait
+                else f"impl {field(node, 'type')}",
+                "members": member_rows(node),
+            }
         )
-        add("impl blocks", f"  {line_of(src, node, offset)}: {header}")
-        for mkind, rendered, doc, _ in members_of(node, spec, src, offset):
-            for docline in doc:
-                add("impl blocks", f"        {docline}")
-            add(
-                "impl blocks",
-                f"        {'fn' if mkind == 'method' else '  '} {rendered}",
-            )
 
     for node in walk(root_node, spec.consts):
         if is_file_const(node, spec):
-            add(
-                "const/var",
-                f"  {line_of(src, node, offset)}: {render_const(node, spec)}",
+            data["consts"].append(
+                {"line": line_of(src, node, offset), "text": render_const(node, spec)}
             )
         elif is_prototype(node, spec) and at_file_scope(node, spec):
             # A header's API surface: listed like functions, apart from data.
-            add(
-                "prototypes", f"  {line_of(src, node, offset)}: {signature(node, spec)}"
+            data["prototypes"].append(
+                {
+                    "line": line_of(src, node, offset),
+                    "name": resolve_name(node, spec),
+                    "signature": signature(node, spec),
+                    "doc": doc_comment(node, spec),
+                }
             )
-            for docline in doc_comment(node, spec):
-                add("prototypes", f"        {docline}")
 
     containers = list(types) + list(walk(root_node, spec.impl_blocks))
     owned = {
@@ -1719,50 +2180,185 @@ def outline_sections(segment):
         # all buries the handful that describe the file. Keep the outermost
         # ones; `decl` still finds anything nested by name.
         free = [n for n in free if not any_ancestor_is_def(n, spec)]
-    title = "declarations" if spec.top_level_only else "funcs"
     for node in sorted(free, key=lambda n: n.start_byte):
-        add(title, f"  {line_of(src, node, offset)}: {describe(node, spec)}")
-        for docline in doc_comment(node, spec):
+        data["funcs"].append(
+            {
+                "line": line_of(src, node, offset),
+                "name": resolve_name(node, spec),
+                "owner": receiver_type(node, spec),
+                "signature": describe(node, spec),
+                "doc": doc_comment(node, spec),
+            }
+        )
+    data["top_level_only"] = spec.top_level_only
+    return data
+
+
+def outline_sections(segment):
+    """-> {section title: [lines]} for one parsed region; "" holds the header.
+
+    Collected rather than printed so that a file parsed as several regions
+    (SQL, one statement each) still reads as one outline.
+    """
+    data = outline_data(segment)
+    sections = {}
+
+    def add(title, line):
+        sections.setdefault(title, []).append(line)
+
+    for line in data["header"]:
+        add("", line)
+    for line in data["imports"]:
+        add("imports", f"  {line}")
+    for item in data["types"]:
+        for docline in item["doc"]:
+            add("types", f"    {docline}")
+        add("types", f"  {item['line']}: {item['heading']}")
+        for member in item["members"]:
+            for docline in member["doc"]:
+                add("types", f"        {docline}")
+            add(
+                "types",
+                f"        {'fn' if member['kind'] == 'method' else '  '} {member['text']}",
+            )
+    for item in data["impl_blocks"]:
+        add("impl blocks", f"  {item['line']}: {item['heading']}")
+        for member in item["members"]:
+            for docline in member["doc"]:
+                add("impl blocks", f"        {docline}")
+            add(
+                "impl blocks",
+                f"        {'fn' if member['kind'] == 'method' else '  '} {member['text']}",
+            )
+    for item in data["consts"]:
+        add("const/var", f"  {item['line']}: {item['text']}")
+    for item in data["prototypes"]:
+        add("prototypes", f"  {item['line']}: {item['signature']}")
+        for docline in item["doc"]:
+            add("prototypes", f"        {docline}")
+    title = "declarations" if data["top_level_only"] else "funcs"
+    for item in data["funcs"]:
+        add(title, f"  {item['line']}: {item['signature']}")
+        for docline in item["doc"]:
             add(title, f"        {docline}")
     return sections
 
 
+# Nodes that wrap a declaration and carry part of how it is written: Python
+# decorators, `export`, Go's `type` keyword.
+_DECL_WRAPPERS = frozenset(
+    {"decorated_definition", "export_statement", "type_declaration"}
+)
+
+
+def decl_span(node):
+    """The node whose source is the whole declaration as written."""
+    parent = node.parent
+    if parent is None or parent.type not in _DECL_WRAPPERS:
+        return node
+    if parent.type == "type_declaration" and (
+        sum(1 for c in parent.named_children if c.type in ("type_spec", "type_alias"))
+        != 1
+    ):
+        return node  # `type ( A ...; B ... )`: print only the one asked for
+    return parent
+
+
+def const_names(node, spec):
+    """Names a const/var declaration binds: `const a = 1, b = 2` -> {a, b}."""
+    names = set()
+    own = node.child_by_field_name("name") or node.child_by_field_name("left")
+    if own is not None and own.type.endswith("identifier"):
+        names.add(text(own))
+    for decl in walk(
+        node,
+        (
+            "variable_declarator",
+            "const_spec",
+            "var_spec",
+            "init_declarator",
+            "static_item",
+            "const_item",
+        ),
+    ):
+        named = decl.child_by_field_name("name") or decl.child_by_field_name(
+            "declarator"
+        )
+        if named is not None:
+            names.add(text(named).split("[")[0].strip("* "))
+    return names
+
+
+_MACRO_PREFIX = re.compile(rb"[ \t]*(?:[A-Z][A-Z0-9_]{2,}[ \t]+)+")
+
+
+def _macro_prefix_start(src, start):
+    """Start of the line when only attribute macros precede the declaration on
+    it (`LUA_API int f(...)`): those were blanked for parsing and belong to
+    the declaration as written."""
+    line_start = src.rfind(b"\n", 0, start) + 1
+    prefix = src[line_start:start]
+    if prefix.strip() and _MACRO_PREFIX.fullmatch(prefix):
+        return line_start + len(prefix) - len(prefix.lstrip())
+    return start
+
+
+def decl_rows(name, root, opts):
+    rows = []
+
+    def add(path, src, spec, offset, node, kind):
+        span = decl_span(node)
+        owner = receiver_type(node, spec)
+        start = _macro_prefix_start(src, span.start_byte)
+        rows.append(
+            {
+                "file": path,
+                "line": line_of(src, span, offset),
+                "language": spec.key,
+                "kind": kind,
+                "owner": owner,
+                "doc": doc_comment(span, spec, docstring=False),
+                # From the source, not node.text: a retry parse may have
+                # blanked syntax the grammar rejects (PL/pgSQL, Go `new`).
+                "source": src[start : span.end_byte].decode("utf8", "replace"),
+            }
+        )
+
+    consts = []
+    for path, src, tree, spec, offset in iter_parsed(root, opts):
+        for node in walk_decls(
+            tree.root_node, spec, tuple(set(spec.defs) | set(spec.types))
+        ):
+            if name_matches(node, spec, name):
+                add(path, src, spec, offset, node, node.type)
+        for node in walk(tree.root_node, spec.consts):
+            if name in const_names(node, spec):
+                consts.append((path, src, spec, offset, node))
+    if not rows:
+        # A constant, or an ambient `declare global { const x: T }`.
+        for path, src, spec, offset, node in consts:
+            add(path, src, spec, offset, node, node.type)
+    return rows
+
+
 def cmd_decl(name, root, opts, emit):
-    found = False
-    for path, src, tree, spec, offset in iter_parsed(root, opts):
-        for node in walk_decls(
-            tree.root_node, spec, tuple(set(spec.defs) | set(spec.types))
-        ):
-            if not name_matches(node, spec, name):
-                continue
-            found = True
-            owner = receiver_type(node, spec)
-            label = f"{spec.key} {node.type}" + (f" on {owner}" if owner else "")
-            emit(f"=== {path}:{line_of(src, node, offset)} ({label}) ===")
-            for docline in doc_comment(node, spec):
-                emit(docline)
-            # From the source, not node.text: a retry parse may have blanked
-            # syntax the grammar rejects (PL/pgSQL control flow, Go `new`).
-            emit(src[node.start_byte : node.end_byte].decode("utf8", "replace"))
-            emit("")
-    if not found:
+    rows = decl_rows(name, root, opts)
+    if opts["json"]:
+        for row in rows:
+            emit(row)
+        return
+    if not rows:
         emit(f"no declaration named {name!r} found under {root}")
-
-
-def declaration_sites(name, root, opts):
-    """Every declaration of *name*, as (path, line, owner)."""
-    sites = []
-    for path, src, tree, spec, offset in iter_parsed(root, opts):
-        for node in walk_decls(
-            tree.root_node, spec, tuple(set(spec.defs) | set(spec.types))
-        ):
-            if name_matches(node, spec, name) or name_matches(
-                node, spec, query_key(name, spec)
-            ):
-                sites.append(
-                    (path, line_of(src, node, offset), receiver_type(node, spec))
-                )
-    return sites
+        return
+    for row in rows:
+        label = f"{row['language']} {row['kind']}" + (
+            f" on {row['owner']}" if row["owner"] else ""
+        )
+        emit(f"=== {row['file']}:{row['line']} ({label}) ===")
+        for docline in row["doc"]:
+            emit(docline)
+        emit(row["source"])
+        emit("")
 
 
 def path_distance(a, b):
@@ -1815,10 +2411,10 @@ def rank_candidates(candidates, call_site, prefer_same_file=True):
         # lives in another file; only a same-file target is read off the syntax.
         return candidates, "EXTRACTED" if candidates[0][0] == call_site else "INFERRED"
 
-    test_c = [c for c in candidates if is_test(c[0])]
-    other_c = [c for c in candidates if not is_test(c[0])]
+    test_c = [c for c in candidates if is_test_candidate(c[0])]
+    other_c = [c for c in candidates if not is_test_candidate(c[0])]
 
-    if is_test(call_site):
+    if is_test_candidate(call_site):
         same_file = [c for c in test_c if c[0] == call_site]
         survivors = same_file or test_c or other_c
     else:
@@ -1842,6 +2438,8 @@ def callee_expression(node, spec):
     """
     if spec.call_hook:
         return _CALL_HOOKS[spec.call_hook](node, spec)
+    if node.type == "path_expression":
+        return text(node)
     fn = node.child_by_field_name("function") or node.child_by_field_name("name")
     if fn is None and node.named_children:
         fn = node.named_children[0]
@@ -1928,7 +2526,57 @@ def _css_ref(node, spec):
     return text(args.named_children[0]).strip("\"'")
 
 
+def site_line(node, spec, src, offset, qualified):
+    """Line of a call site. A Fish command continued after a variable
+    override starts on the override's line; the command word is further down."""
+    line = line_of(src, node, offset)
+    if spec.key == "fish" and field(node, "name").startswith("\\"):
+        body = text(node)
+        found = re.search(rf"(?<![\w-]){re.escape(qualified)}(?![\w-])", body)
+        if found:
+            line += body[: found.start()].count("\n")
+    return line
+
+
+def _fish_call(node, spec):
+    """The command a Fish `command` node runs.
+
+    `a=$x \\<newline> b=$y cmd args`: after a line continuation following a
+    variable override the grammar takes the backslash for the command name.
+    The real name is the first word that is not an override.
+    """
+    name = field(node, "name")
+    if name and not name.startswith("\\"):
+        return name
+    for word in text(node).replace("\\\n", " ").split():
+        if word == "\\" or re.match(r"^[A-Za-z_]\w*=", word):
+            continue
+        return word
+    return None
+
+
+def _php_call(node, spec):
+    """`$this->save()`, `$x->go()`, `Foo::make()`: keep the receiver, or a
+    member call reads as a bare call and matches every method of that name."""
+    name = field(node, "name")
+    if (
+        node.type == "member_call_expression"
+        or node.type == "nullsafe_member_call_expression"
+    ):
+        target = node.child_by_field_name("object")
+        return (
+            f"{' '.join(text(target).split())}->{name}" if target is not None else name
+        )
+    if node.type == "scoped_call_expression":
+        scope = node.child_by_field_name("scope")
+        return f"{' '.join(text(scope).split())}::{name}" if scope is not None else name
+    function = node.child_by_field_name("function")
+    return " ".join(text(function).split()) if function is not None else name or None
+
+
 _CALL_HOOKS = {
+    "fish_call": _fish_call,
+    "php_call": _php_call,
     "ps_call": _ps_call,
     "sql_ref": _sql_ref,
     "html_ref": _html_ref,
@@ -1975,8 +2623,12 @@ def query_key(name, spec):
     return bare_name(name, spec) if spec.key in ("sql", "html", "css") else name
 
 
-def resolve_call(qualified, node, spec, path, src, offset, declarations):
-    """Rank the declarations that could be the target of one call site."""
+def resolve_call(qualified, node, spec, path, src, offset, declarations, prefer=None):
+    """Rank the declarations that could be the target of one call site.
+
+    *prefer* overrides whether a same-file candidate wins outright; None keeps
+    the positional rule (bare calls and calls on `this`/`self`).
+    """
     pool = declarations
     # A qualified call such as `p.q.Poll` is dispatched on another receiver, so
     # the enclosing method of the same name is not the callee -- without this, a
@@ -1988,17 +2640,28 @@ def resolve_call(qualified, node, spec, path, src, offset, declarations):
             pool = [
                 c for c in declarations if not (c[0] == path and c[1] == enclosing_line)
             ] or declarations
-    return rank_candidates(
-        pool, path, prefer_same_file=_calls_own_scope(qualified, node, spec)
-    )
+    if prefer is None:
+        prefer = _calls_own_scope(qualified, node, spec)
+    return rank_candidates(pool, path, prefer_same_file=prefer)
 
 
 # Receivers that mean "this object", so a same-file declaration is the one
 # being called. `view.render()` names some other object, whose type the syntax
 # does not give; a same-named method in this file is no evidence for it.
-_SELF_RECEIVERS = frozenset(
-    {"this", "self", "Self", "cls", "super", "base", "$this", "static", "parent"}
-)
+_SELF_RECEIVERS = SELF_RECEIVERS
+
+
+def _go_receiver(node):
+    """(name, type) of the Go method enclosing *node*, or (None, None)."""
+    cur = node.parent
+    while cur is not None and cur.type != "method_declaration":
+        cur = cur.parent
+    receiver = cur.child_by_field_name("receiver") if cur is not None else None
+    for param in (
+        walk(receiver, ("parameter_declaration",)) if receiver is not None else ()
+    ):
+        return field(param, "name"), field(param, "type").lstrip("*&")
+    return None, None
 
 
 def _calls_own_scope(qualified, node, spec):
@@ -2011,15 +2674,7 @@ def _calls_own_scope(qualified, node, spec):
         return True
     if spec.key == "go":
         # Go names its receiver freely: `func (q *fifo) Poll() { q.helper() }`.
-        cur = node.parent
-        while cur is not None and cur.type != "method_declaration":
-            cur = cur.parent
-        receiver = cur.child_by_field_name("receiver") if cur is not None else None
-        for param in (
-            walk(receiver, ("parameter_declaration",)) if receiver is not None else ()
-        ):
-            if field(param, "name") == head:
-                return True
+        return _go_receiver(node)[0] == head
     return False
 
 
@@ -2048,66 +2703,519 @@ def argument_references(node, spec):
     ]
 
 
-def cmd_refs(name, root, opts, emit):
-    declarations = declaration_sites(name, root, opts)
-    hits = 0
+# --------------------------------------------------------------------------
+# receivers and scopes: what a qualified name can refer to
+# --------------------------------------------------------------------------
+
+
+def decl_key(path, node, src, offset):
+    """Unique key of a declaration: two can share a line (`a = { b = 1; }`)."""
+    return f"{path}:{line_of(src, node, offset)}:{node.start_point[1]}"
+
+
+def field_types(node, spec):
+    """-> [(field name, written type)] for the members of a type declaration."""
+    body = type_body(node) or node
+    barriers = set(spec.types) | set(spec.defs) | set(spec.impl_blocks)
+    out = []
+    for member in walk_shallow(body, spec.members, barriers):
+        holder = member
+        tnode = member.child_by_field_name("type")
+        if tnode is None:
+            inner = _child(member, "variable_declaration")  # C# fields
+            if inner is not None:
+                holder, tnode = inner, inner.child_by_field_name("type")
+        if tnode is None:
+            continue
+        written = text(tnode).lstrip(":").strip()
+        names = []
+        for fname in ("name", "left"):
+            named = member.child_by_field_name(fname)
+            if named is not None and named.type.endswith("identifier"):
+                names.append(text(named))
+        for decl in walk(
+            holder, ("variable_declarator", "field_identifier", "property_element")
+        ):
+            named = (
+                decl.child_by_field_name("name")
+                if decl.type != "field_identifier"
+                else decl
+            )
+            if named is None:
+                named = _child(decl, "identifier")
+            if named is not None:
+                names.append(text(named))
+        out.extend((name.lstrip("$"), written.lstrip("?")) for name in names)
+    return out
+
+
+def nix_scope(name, node):
+    """How a Nix name is bound where *node* uses it.
+
+    -> ("param", None) for a lambda argument, ("let", binding) for a `let` or
+    `rec` binding in an enclosing scope, ("inherit", None) for an inherited
+    name, ("with", None) when only a `with` could supply it, ("free", None)
+    otherwise. Laziness does not matter here: this is lexical scope.
+    """
+    seen_with = False
+    cur, child = node.parent, node
+    while cur is not None:
+        if cur.type == "function_expression":
+            body = cur.child_by_field_name("body")
+            in_body = body is not None and body.start_byte <= child.start_byte
+            if in_body:
+                universal = cur.child_by_field_name("universal")
+                if universal is not None and text(universal) == name:
+                    return "param", None
+                formals = cur.child_by_field_name("formals")
+                for formal in walk(formals, ("formal",)) if formals is not None else ():
+                    if field(formal, "name") == name:
+                        return "param", None
+                # `{ ... }@args:` names the whole set.
+                for ident in cur.named_children:
+                    if ident.type == "identifier" and text(ident) == name:
+                        return "param", None
+        if cur.type in ("let_expression", "rec_attrset_expression"):
+            for bindings in cur.named_children:
+                if bindings.type != "binding_set":
+                    continue
+                for binding in bindings.named_children:
+                    if binding.type == "binding":
+                        attrpath = binding.child_by_field_name("attrpath")
+                        first = (
+                            attrpath.named_children[0]
+                            if attrpath is not None and attrpath.named_children
+                            else None
+                        )
+                        if first is not None and text(first) == name:
+                            return "let", binding
+                    elif binding.type in ("inherit", "inherit_from"):
+                        attrs = binding.child_by_field_name("attrs")
+                        if attrs is not None and name in text(attrs).split():
+                            return "inherit", None
+        if cur.type == "with_expression":
+            env = cur.child_by_field_name("environment")
+            if env is None or not (env.start_byte <= child.start_byte < env.end_byte):
+                seen_with = True
+        child, cur = cur, cur.parent
+    return ("with", None) if seen_with else ("free", None)
+
+
+def nix_path_kind(node):
+    """How a Nix path literal is used: import, callPackage, imports or path."""
+    parent = node.parent
+    if parent is not None and parent.type == "apply_expression":
+        function = parent.child_by_field_name("function")
+        if function is not None and function is not node:
+            name = text(function).split(".")[-1].strip()
+            if name == "import":
+                return "import"
+            if name == "callPackage":
+                return "callPackage"
+    if parent is not None and parent.type == "list_expression":
+        binding = parent.parent
+        if (
+            binding is not None
+            and binding.type == "binding"
+            and field(binding, "attrpath").split(".")[-1] == "imports"
+        ):
+            return "imports"
+    return "path"
+
+
+def nix_path_target(node, importer):
+    """-> (resolved file or None, literal). A directory means its default.nix;
+    `./x/${name}.nix` is computed and cannot be resolved; `<nixpkgs>`, `/abs`
+    and `~/x` are outside the repo."""
+    literal = text(node)
+    if node.type != "path_expression":
+        return None, literal
+    dest, _ = nix_path_target_text(literal, importer)
+    return (dest, literal) if dest and dest.endswith(".nix") else (None, literal)
+
+
+def nix_path_refs(tree, path):
+    """-> [(node, kind, resolved or None)] for every path-valued import or
+    relative path literal in a Nix file, computed ones included."""
+    out = []
+    for node in walk(tree.root_node, ("path_expression", "apply_expression")):
+        if node.type == "path_expression":
+            dest, literal = nix_path_target(node, path)
+            if literal.startswith(("./", "../")) or "${" in literal:
+                out.append((node, nix_path_kind(node), dest))
+        else:
+            function = node.child_by_field_name("function")
+            argument = node.child_by_field_name("argument")
+            if (
+                function is not None
+                and text(function).strip() == "import"
+                and argument is not None
+                and argument.type in ("string_expression", "indented_string_expression")
+            ):
+                out.append((argument, "import", None))  # import "${p}/x.nix"
+    return out
+
+
+def nix_path_match(node, spec, path, query, root):
+    """For `refs <file>` on a Nix path literal: the row fields if it names the
+    queried file, else None."""
+    if spec.key != "nix" or node.type != "path_expression":
+        return None
+    dest, literal = nix_path_target(node, path)
+    if dest is None:
+        return None
+    wanted = query.replace("\\", "/")
+    rel = os.path.relpath(dest, root).replace(os.sep, "/")
+    shown = dest.replace(os.sep, "/")
+    if not (
+        wanted in (rel, shown)
+        or shown.endswith("/" + wanted.lstrip("./"))
+        or os.path.abspath(query) == os.path.abspath(dest)
+        or ("/" not in wanted and os.path.basename(dest) == wanted)
+    ):
+        return {"skip": True}
+    return {
+        "kind": "reference",
+        "text": literal,
+        "label": "EXTRACTED",
+        "reason": nix_path_kind(node),
+        "target": {"file": dest, "line": 1, "owner": ""},
+        "target_name": os.path.basename(dest),
+    }
+
+
+class Resolver:
+    """Declarations plus the facts needed to judge a call site, built once."""
+
+    def __init__(self, root, opts):
+        self.root = root
+        self.types, self.ifaces, self.fields, self.go_packages = set(), set(), {}, set()
+        self.nodes, self.by_name, self.by_func, self.contract_keys = (
+            collect_declarations(root, opts, self._index_type)
+        )
+        self.outside, self.inside = import_heads(root, opts)
+        self._scopes, self._locals = {}, {}
+
+    def _index_type(self, node, spec, tree):
+        """Called by collect_declarations for each type and once per tree
+        (node None), so the repo is walked once for both."""
+        if node is None:
+            if spec.key == "go":
+                for clause in tree.root_node.named_children:
+                    if clause.type == "package_clause":
+                        ident = _child(clause, "package_identifier")
+                        if ident is not None:
+                            self.go_packages.add(text(ident))
+            return
+        name = resolve_name(node, spec)
+        if not name:
+            return
+        self.types.add(name)
+        if node.type in spec.ifaces or next(iter(walk(node, spec.ifaces or ())), None):
+            self.ifaces.add(name)
+        for fname, written in field_types(node, spec):
+            self.fields.setdefault((name, fname), written)
+
+    # -- classification -------------------------------------------------
+
+    def _scope(self, node, spec, src):
+        """(cache key, full text, cut) for the outermost enclosing function:
+        *cut* is where *node* starts in that text."""
+        start, end, cur = 0, len(src), node.parent
+        while cur is not None:
+            if cur.type in spec.defs:
+                start, end = cur.start_byte, cur.end_byte
+            cur = cur.parent
+        key = (id(src), start)
+        entry = self._scopes.get(key)
+        if entry is None:
+            raw = src[start:end]
+            entry = (raw.decode("utf8", "replace"), raw.isascii())
+            self._scopes[key] = entry
+        full, ascii_only = entry
+        cut = node.start_byte - start
+        if not ascii_only:
+            cut = len(src[start : node.start_byte].decode("utf8", "replace"))
+        return key, full, cut
+
+    def local_facts(self, name, node, spec, src):
+        """-> (written type or None, declared locally) for *name* before *node*."""
+        key, full, cut = self._scope(node, spec, src)
+        facts = self._locals.get((key, name, spec.key))
+        if facts is None:
+            facts = (
+                type_matches(name, full, spec.key),
+                declaration_positions(name, full),
+            )
+            self._locals[(key, name, spec.key)] = facts
+        typed = [word for position, word in facts[0] if position < cut]
+        declared = any(position < cut for position in facts[1])
+        return (typed[-1] if typed else None), declared
+
+    def own_type(self, node, spec):
+        if spec.key == "go":
+            return _go_receiver(node)[1] or None
+        cur = node.parent
+        while cur is not None:
+            if cur.type in spec.defs:
+                owner = receiver_type(cur, spec)
+                if owner:
+                    return owner
+            cur = cur.parent
+        return None
+
+    def classify(self, expr, node, spec, path, src):
+        """-> (mode, detail) for the receiver of *expr* at *node*.
+
+        modes: bare, legacy (no receiver concept), external, module, owner,
+        self, unknown; for Nix also local and binding.
+        """
+        if spec.key == "nix":
+            return self._classify_nix(expr, node)
+        if spec.key not in RECEIVER_LANGS:
+            return "legacy", None
+        receiver, sep = split_receiver(expr)
+        if receiver is None:
+            return "bare", None
+        heads = segments(receiver)
+        if not heads:
+            return "unknown", None
+        if sep == "::":
+            if heads[0] in self.outside.get(path, ()):
+                return "external", f"module {heads[0]}"
+            last = re.split(r"[<\[]", heads[-1])[0].lstrip("\\")
+            if last in ("Self", "self", "static") and len(heads) == 1:
+                # Rust `Self::new`, PHP `self::make` / `static::make`.
+                own = self.own_type(node, spec)
+                if spec.key == "rust" and last == "self":
+                    return "module", None  # `self::helper` is a module path
+                return ("self", own) if own else ("unknown", None)
+            if last == "parent" and spec.key == "php":
+                return "unknown", "the parent class"
+            if last in ("crate", "super"):
+                return "module", None
+            if last in self.types:
+                return "owner", last
+            if last[:1].isupper():
+                return "external", f"type {last}"
+            return "module", None
+        if any(ch in part for part in heads for ch in "([{"):
+            return "unknown", "the result of a call"
+        base, rest = heads[0], heads[1:]
+        go_name, go_type = _go_receiver(node) if spec.key == "go" else (None, None)
+        if base in _SELF_RECEIVERS or (go_name and base == go_name):
+            owner = (
+                go_type if go_name and base == go_name else self.own_type(node, spec)
+            )
+            if not owner:
+                return "unknown", None
+            if not rest:
+                return "self", owner
+            return self._follow_fields(owner, rest)
+        written, declared = self.local_facts(base, node, spec, src)
+        if base in self.outside.get(path, ()) and not declared:
+            return "external", f"module {base}"
+        if written is None and not declared:
+            if base in self.inside.get(path, ()) or (
+                spec.key == "go" and base in self.go_packages
+            ):
+                return ("module", None) if not rest else ("unknown", None)
+            if base in self.types:
+                return ("owner", base) if not rest else ("unknown", None)
+            if base[:1].isupper() and spec.key != "go":
+                return "external", f"type {base}"
+        if written is None:
+            return "unknown", None
+        qualifier, typename = normalise_type(written)
+        if qualifier and qualifier in self.outside.get(path, ()):
+            return "external", f"type {written}"
+        if typename not in self.types:
+            return "external", f"type {written}"
+        return self._follow_fields(typename, rest) if rest else ("owner", typename)
+
+    def _follow_fields(self, typename, fields):
+        for name in fields:
+            written = self.fields.get((typename, name))
+            if written is None:
+                return "unknown", f"field {typename}.{name}"
+            _, typename = normalise_type(written)
+            if typename not in self.types:
+                return "external", f"type {written}"
+        return "owner", typename
+
+    def _classify_nix(self, expr, node):
+        head = expr.split(".")[0]
+        kind, binding = nix_scope(head, node)
+        qualified = "." in expr
+        if kind in ("param", "inherit"):
+            what = "a lambda parameter" if kind == "param" else "an inherited name"
+            if qualified:
+                return "local", f"attribute of {head}, {what}"
+            return "local", f"{head} is {what}"
+        if kind == "let":
+            if qualified:
+                return "local", f"attribute of {head}, a local binding"
+            return "binding", binding
+        # A free name or one a `with` may supply: name-based, never EXTRACTED
+        # for a selected attribute, which is not syntactic evidence.
+        return ("capped", None) if qualified or kind == "with" else ("legacy", None)
+
+    # -- narrowing ------------------------------------------------------
+
+    def narrow(self, mode, detail, pool, spec, callback=False):
+        """-> (pool, prefer_same_file, verdict); verdict is None, 'drop' or
+        'receiver' (the receiver's type is unknown: no edge, list candidates).
+        """
+        if mode in ("bare", "legacy", "capped"):
+            return pool, None, None
+        if mode in ("external", "local"):
+            return [], False, "drop"
+        if mode == "module":
+            owned = [c for c in pool if not c[2]]
+            return (owned, True, None) if owned else ([], False, "drop")
+        if mode in ("owner", "self"):
+            if detail in self.ifaces:
+                return pool, False, None  # interface dispatch, handled by caller
+            mine = [c for c in pool if c[2] == detail]
+            if mine:
+                return mine, True, None
+            if callback:
+                return [], False, "drop"
+            methods = [c for c in pool if c[2]]
+            if mode == "self" and methods:
+                return methods, True, None  # inherited: ranked by position
+            return (methods, False, "receiver") if methods else ([], False, "drop")
+        # unknown receiver
+        if callback:
+            return [], False, "drop"
+        methods = [c for c in pool if c[2]] if spec.key in METHODS_ONLY else pool
+        return (methods, False, "receiver") if methods else ([], False, "drop")
+
+
+_LEGEND = (
+    "\nEXTRACTED = callee declared in this same file. "
+    "INFERRED = one plausible declaration elsewhere. "
+    "AMBIGUOUS = several survive ranking; verify before trusting. "
+    "UNRESOLVED = no target can be read off the syntax: the receiver's type is "
+    "unknown or outside this repo, or a linked file does not exist. "
+    "LOCAL = a parameter or local binding, not a declaration."
+)
+
+
+def refs_rows(name, root, opts, resolver=None):
+    """-> list of dicts, one per call site or reference named *name*."""
+    resolver = resolver or Resolver(root, opts)
+    rows = []
     for path, src, tree, spec, offset in iter_parsed(root, opts):
         wanted = canon(query_key(name, spec), spec)
         for node, qualified in iter_calls(tree.root_node, spec):
-            if canon(bare_name(qualified, spec), spec) != wanted:
+            path_hit = nix_path_match(node, spec, path, name, resolver.root)
+            if path_hit is not None and path_hit.get("skip"):
                 continue
-            hits += 1
+            if path_hit is None and canon(bare_name(qualified, spec), spec) != wanted:
+                continue
             is_ref = is_reference(node, spec)
-            shown = " ".join(text(node).split())[:70] if is_ref else f"{qualified}(...)"
-            ranked, confidence = resolve_call(
-                qualified, node, spec, path, src, offset, declarations
-            )
-            target = ""
-            if ranked:
-                best = ranked[0]
-                owner = f"{best[2]}." if best[2] else ""
-                target = f" -> {owner}{name} at {best[0]}:{best[1]}"
-                if confidence == "AMBIGUOUS":
-                    target += f" (+{len(ranked) - 1} more)"
-            emit(
-                f"{path}:{line_of(src, node, offset)}: {shown}"
-                f"   [{enclosing_decl(node, spec)}]  "
-                f"{'reference, ' if is_ref else ''}{confidence}{target}"
-            )
-    if not hits:
+            row = {
+                "file": path,
+                "line": site_line(node, spec, src, offset, qualified),
+                "expr": qualified,
+                "kind": "reference" if is_ref else "call",
+                "text": " ".join(text(node).split())[:70]
+                if is_ref
+                else f"{qualified}(...)",
+                "enclosing": enclosing_decl(node, spec),
+                "label": "UNRESOLVED",
+                "reason": "",
+                "target": None,
+                "candidates": [],
+            }
+            if path_hit is not None:
+                row.update(path_hit)
+                rows.append(row)
+                continue
+            pool = resolver.by_name.get(canon(query_key(name, spec), spec), [])
+            mode, detail = resolver.classify(qualified, node, spec, path, src)
+            if mode == "binding":
+                key = decl_key(path, detail, src, offset)
+                found = [c for c in pool if c[3] == key]
+                if found:
+                    row.update(label="EXTRACTED", target=_target(found[0]))
+                    rows.append(row)
+                    continue
+            narrowed, prefer, verdict = resolver.narrow(mode, detail, pool, spec)
+            if mode == "local":
+                row.update(label="LOCAL", reason=detail)
+            elif verdict == "drop":
+                row["reason"] = (
+                    f"receiver is {detail}, not declared in this repo"
+                    if mode == "external"
+                    else "receiver type unknown; no method of that name here"
+                )
+            elif verdict == "receiver":
+                ranked = sorted(
+                    narrowed, key=lambda c: (path_distance(c[0], path), c[0], c[1])
+                )
+                row.update(
+                    label="AMBIGUOUS" if len(ranked) > 1 else "UNRESOLVED",
+                    reason="receiver type unknown",
+                    target=_target(ranked[0]),
+                    candidates=[_target(c) for c in ranked],
+                )
+            else:
+                ranked, confidence = resolve_call(
+                    qualified, node, spec, path, src, offset, narrowed, prefer
+                )
+                if mode == "capped" and confidence == "EXTRACTED":
+                    confidence = "INFERRED"
+                row["label"] = confidence
+                if ranked:
+                    row["target"] = _target(ranked[0])
+                    row["candidates"] = [_target(c) for c in ranked]
+            rows.append(row)
+    return rows
+
+
+def _target(candidate):
+    path, line, owner, _key = candidate
+    return {"file": path, "line": line, "owner": owner}
+
+
+def cmd_refs(name, root, opts, emit):
+    rows = refs_rows(name, root, opts)
+    if opts["json"]:
+        for row in rows:
+            emit(row)
+        return
+    if not rows:
         emit(f"no calls to {name!r} found under {root}")
         return
-    emit(
-        "\nEXTRACTED = callee declared in this same file. "
-        "INFERRED = one plausible declaration elsewhere. "
-        "AMBIGUOUS = several survive ranking; verify before trusting."
-    )
-
-
-def cmd_iface(name, root, opts, emit):
-    for path, src, tree, spec, offset in iter_parsed(root, opts):
-        for node in walk_decls(tree.root_node, spec, spec.types):
-            if not name_matches(node, spec, name):
-                continue
-            # Go puts the interface_type under the type_spec.
-            target = node
-            if spec.ifaces:
-                inner = next(iter(walk(node, spec.ifaces)), None)
-                if inner is not None:
-                    target = inner
-                elif node.type not in spec.ifaces:
-                    continue
-            emit(f"=== {path}:{line_of(src, node, offset)} interface {name} ===")
-            for docline in doc_comment(node.parent or node, spec):
-                emit(docline)
-            for _, rendered, doc, _ in members_of(target, spec, src, offset):
-                for docline in doc:
-                    emit(f"  {docline}")
-                emit(f"  {rendered}")
+    for row in rows:
+        target = ""
+        best = row["target"]
+        if best:
+            owner = f"{best['owner']}." if best["owner"] else ""
+            shown = row.get("target_name") or name
+            target = f" -> {owner}{shown} at {best['file']}:{best['line']}"
+            if row["label"] == "AMBIGUOUS":
+                target += f" (+{len(row['candidates']) - 1} more)"
+        reason = f" ({row['reason']})" if row["reason"] else ""
+        emit(
+            f"{row['file']}:{row['line']}: {row['text']}"
+            f"   [{row['enclosing']}]  "
+            f"{row['kind'] + ', ' if row['kind'] != 'call' else ''}"
+            f"{row['label']}{reason}{target}"
+        )
+    emit(_LEGEND)
 
 
 def method_sets(root, opts, skip_ifaces=False):
-    """-> {type_name: [(path, line, method_name, signature, doc)]}"""
+    """-> {type_name: [(path, line, method_name, signature, doc, where)]}
+
+    *where* is "" for a method defined in its type, "out of class" for a C++
+    definition such as `Status DBImpl::Get(...)`, and "declared" for a C++
+    method declared in the class body and defined nowhere in scope (pure
+    virtual, or defined in a file outside it).
+    """
     sets = {}
     iface_names = set()
     if skip_ifaces:
@@ -2116,11 +3224,13 @@ def method_sets(root, opts, skip_ifaces=False):
                 iface_names.add(resolve_name(node, spec))
                 if node.parent is not None:
                     iface_names.add(resolve_name(node.parent, spec))
+    declared = []
     for path, src, tree, spec, offset in iter_parsed(root, opts):
         for node in walk(tree.root_node, spec.defs):
             owner = receiver_type(node, spec)
             if not owner or owner in iface_names:
                 continue
+            inside = any(a.type in spec.types for a in _ancestors(node))
             sets.setdefault(owner, []).append(
                 (
                     path,
@@ -2128,18 +3238,65 @@ def method_sets(root, opts, skip_ifaces=False):
                     resolve_name(node, spec),
                     signature(node, spec),
                     doc_comment(node, spec),
+                    ""
+                    if inside or spec.name_hook != "c_declarator"
+                    else "out of class",
                 )
             )
+        if spec.name_hook == "c_declarator":
+            for node in walk(tree.root_node, ("field_declaration",)):
+                if is_method_prototype(node, spec):
+                    owner = receiver_type(node, spec)
+                    if owner:
+                        declared.append(
+                            (
+                                owner,
+                                (
+                                    path,
+                                    line_of(src, node, offset),
+                                    resolve_name(node, spec),
+                                    signature(node, spec),
+                                    doc_comment(node, spec),
+                                    "declared",
+                                ),
+                            )
+                        )
+    for owner, entry in declared:
+        have = {e[2] for e in sets.get(owner, [])}
+        if entry[2] not in have:
+            sets.setdefault(owner, []).append(entry)
     return sets
 
 
+def _ancestors(node):
+    cur = node.parent
+    while cur is not None:
+        yield cur
+        cur = cur.parent
+
+
 def cmd_methods(typename, root, opts, emit):
-    entries = method_sets(root, opts).get(typename, [])
+    entries = sorted(
+        method_sets(root, opts).get(typename, []), key=lambda e: (e[0], e[1])
+    )
+    if opts["json"]:
+        for path, line, name, sig, doc, where in entries:
+            emit(
+                {
+                    "file": path,
+                    "line": line,
+                    "name": name,
+                    "signature": sig,
+                    "doc": doc,
+                    "where": where or "in class",
+                }
+            )
+        return
     if not entries:
         emit(f"no methods found on type {typename!r} under {root}")
         return
-    for path, line, _, sig, doc in sorted(entries, key=lambda e: (e[0], e[1])):
-        emit(f"{path}:{line}: {sig}")
+    for path, line, _, sig, doc, where in entries:
+        emit(f"{path}:{line}: {sig}" + (f"   [{where}]" if where else ""))
         for docline in doc:
             emit(f"      {docline}")
 
@@ -2156,12 +3313,26 @@ def cmd_fields(typename, root, opts, emit):
             if not members:
                 continue
             found = True
+            if opts["json"]:
+                emit(
+                    {
+                        "file": path,
+                        "line": line_of(src, node, offset),
+                        "kind": node.type,
+                        "type": typename,
+                        "fields": [
+                            {"line": line, "text": rendered, "doc": doc}
+                            for _, rendered, doc, line in members
+                        ],
+                    }
+                )
+                continue
             emit(f"=== {path}:{line_of(src, node, offset)} {node.type} {typename} ===")
             for _, rendered, doc, line in members:
                 for docline in doc:
                     emit(f"  {docline}")
                 emit(f"  {line}: {rendered}")
-    if not found:
+    if not found and not opts["json"]:
         emit(f"no fields found on type {typename!r} under {root}")
 
 
@@ -2223,6 +3394,17 @@ def cmd_consts(root, opts, emit):
         for node in walk(tree.root_node, spec.consts):
             if not is_file_const(node, spec):
                 continue
+            if opts["json"]:
+                emit(
+                    {
+                        "file": path,
+                        "line": line_of(src, node, offset),
+                        "names": sorted(const_names(node, spec)),
+                        "text": render_const(node, spec).strip(),
+                        "doc": doc_comment(node, spec),
+                    }
+                )
+                continue
             for docline in doc_comment(node, spec):
                 emit(f"  {docline}")
             emit(f"{path}:{line_of(src, node, offset)}: {render_const(node, spec)}")
@@ -2236,38 +3418,302 @@ def cmd_todos(root, opts, emit):
             body = text(node)
             if not any(marker in body for marker in TODO_MARKERS):
                 continue
+            if opts["json"]:
+                emit(
+                    {
+                        "file": path,
+                        "line": line_of(src, node, offset),
+                        "enclosing": enclosing_decl(node, spec),
+                        "text": [ln.strip() for ln in body.split("\n")],
+                    }
+                )
+                continue
             emit(f"{path}:{line_of(src, node, offset)}: [{enclosing_decl(node, spec)}]")
             for line in body.split("\n"):
                 emit(f"  {line.strip()}")
 
 
-def cmd_impls(ifacename, root, opts, emit):
-    required = None
+_SUPERTYPE_NODES = frozenset(
+    {
+        "superclass",  # Java
+        "super_interfaces",  # Java class/record/enum
+        "extends_interfaces",  # Java interface
+        "base_list",  # C#
+        "class_heritage",  # TypeScript/JavaScript class
+        "extends_type_clause",  # TypeScript interface
+        "delegation_specifier",  # Kotlin
+        "delegation_specifiers",
+        "base_clause",  # PHP
+        "class_interface_clause",  # PHP
+        "inheritance_specifier",  # Swift
+        "extends_clause",  # Scala
+        "base_class_clause",  # C++
+    }
+)
+_SUPERTYPE_WORDS = frozenset(
+    {
+        "extends",
+        "implements",
+        "with",
+        "public",
+        "private",
+        "protected",
+        "virtual",
+        "class",
+        "struct",
+        "interface",
+    }
+)
+# Languages whose types state their contracts in an implements/extends clause.
+# For them that clause is authoritative; a matching method set alone is not.
+_DECLARED_ONLY = frozenset(
+    {"java", "c_sharp", "kotlin", "swift", "scala", "php", "rust", "cpp"}
+)
+# Structural or mixed typing: a method-set cover is a real (weaker) signal.
+_STRUCTURAL = frozenset({"go", "typescript", "tsx", "vue", "svelte", "python"})
+
+
+def _strip_generics(written):
+    previous = None
+    while previous != written:
+        previous = written
+        written = re.sub(r"<[^<>]*>|\[[^\[\]]*\]", "", written)
+    return written
+
+
+def bare_type(written):
+    """`ns.I2<X>` / `fmt::Display` / `Psr\\Log\\Logger` -> last name."""
+    stripped = _strip_generics(written).strip()
+    return re.split(r"::|\.|\\", stripped)[-1].strip() if stripped else ""
+
+
+def supertypes(node, spec):
+    """Names a type declaration says it extends or implements, as written."""
+    holders = [c for c in node.named_children if c.type in _SUPERTYPE_NODES]
+    if spec.key == "python":
+        bases = node.child_by_field_name("superclasses")
+        holders = (
+            [c for c in bases.named_children if c.type != "keyword_argument"]
+            if bases is not None
+            else []
+        )
+    out = []
+    for holder in holders:
+        written = _strip_generics(text(holder))
+        for word in re.split(r"[\s,:()]+", written):
+            word = word.strip()
+            if not word or word in _SUPERTYPE_WORDS:
+                continue
+            name = re.split(r"::|\.|\\", word)[-1]
+            if name and (name[0].isalpha() or name[0] == "_") and name not in out:
+                out.append(name)
+    return out
+
+
+def type_index(root, opts):
+    """-> (types, parents): {name: [(path, src, spec, offset, node)]} for every
+    type declaration, and {name: {declared supertype, ...}} including Rust
+    `impl Trait for Type` blocks."""
+    types, parents = {}, {}
     for path, src, tree, spec, offset in iter_parsed(root, opts):
         for node in walk_decls(tree.root_node, spec, spec.types):
-            if not name_matches(node, spec, ifacename):
+            name = resolve_name(node, spec)
+            if not name:
                 continue
-            target = next(iter(walk(node, spec.ifaces)), node)
-            names = {
-                rendered.split("(")[0].strip().split()[-1]
-                for kind, rendered, _, _ in members_of(target, spec, src, offset)
-                if kind == "method"
+            types.setdefault(name, []).append((path, src, spec, offset, node))
+            sups = supertypes(node, spec)
+            if sups:
+                parents.setdefault(name, set()).update(sups)
+        for block in walk(tree.root_node, spec.impl_blocks):
+            trait = field(block, "trait")
+            target = bare_type(field(block, "type"))
+            if trait and target:
+                parents.setdefault(target, set()).add(bare_type(trait))
+    return types, parents
+
+
+def _declared_path(name, wanted, parents, seen=None):
+    """Chain from *name* up to *wanted* through declared supertypes, or None."""
+    seen = seen or set()
+    for parent in sorted(parents.get(name, ())):
+        if parent == wanted:
+            return [parent]
+        if parent not in seen:
+            seen.add(parent)
+            rest = _declared_path(parent, wanted, parents, seen)
+            if rest:
+                return [parent] + rest
+    return None
+
+
+def cmd_iface(name, root, opts, emit):
+    types, _ = type_index(root, opts)
+    shown = set()
+    records = []
+
+    def members(entry):
+        _, src, spec, offset, node = entry
+        target = node
+        if spec.ifaces:
+            inner = next(iter(walk(node, spec.ifaces)), None)
+            if inner is not None:
+                target = inner
+            elif node.type not in spec.ifaces:
+                return None
+        return members_of(target, spec, src, offset)
+
+    def show(iname, indent, via):
+        if iname in shown:
+            return
+        shown.add(iname)
+        for entry in types.get(iname, []):
+            path, src, spec, offset, node = entry
+            found = members(entry)
+            if found is None:
+                continue
+            sups = supertypes(node, spec)
+            record = {
+                "name": iname,
+                "file": path,
+                "line": line_of(src, node, offset),
+                "extends": sups,
+                "inherited_by": via,
+                "doc": doc_comment(node.parent or node, spec) if not via else [],
+                "members": [
+                    {"text": rendered, "doc": doc, "line": line}
+                    for _, rendered, doc, line in found
+                ],
             }
-            if names:
-                required = names
-    if not required:
-        emit(f"no interface {ifacename!r} with methods found under {root}")
+            records.append(record)
+            if not opts["json"]:
+                if via:
+                    emit(f"{indent}inherited from {iname}  ({path}:{record['line']}):")
+                else:
+                    emit(f"=== {path}:{record['line']} interface {iname} ===")
+                    for docline in record["doc"]:
+                        emit(docline)
+                if sups:
+                    emit(f"{indent}  extends {', '.join(sups)}")
+                if not found and not via:
+                    emit(f"{indent}  (no members of its own)")
+                for member in record["members"]:
+                    for docline in member["doc"]:
+                        emit(f"{indent}  {docline}")
+                    emit(f"{indent}  {member['text']}")
+            for parent in sups:
+                if parent in types:
+                    show(parent, indent + "  ", iname)
+                elif not opts["json"] and parent not in shown:
+                    emit(f"{indent}  ({parent} is not declared under {root})")
+                    shown.add(parent)
+
+    show(bare_type(name) or name, "", None)
+    if opts["json"]:
+        for record in records:
+            emit(record)
+    elif not records:
+        emit(f"no interface named {name!r} found under {root}")
+
+
+def cmd_impls(ifacename, root, opts, emit):
+    wanted = bare_type(ifacename) or ifacename
+    types, parents = type_index(root, opts)
+    required, langs = set(), set()
+    for path, src, spec, offset, node in types.get(wanted, []):
+        langs.add(spec.key)
+        target = next(iter(walk(node, spec.ifaces)), node)
+        required |= {
+            rendered.split("(")[0].strip().split()[-1]
+            for kind, rendered, _, _ in members_of(target, spec, src, offset)
+            if kind == "method"
+        }
+    if not langs:
+        emit(f"no interface {ifacename!r} found under {root}")
         return
-    emit(f"interface {ifacename} requires: {', '.join(sorted(required))}\n")
-    for typename, entries in sorted(method_sets(root, opts, skip_ifaces=True).items()):
-        have = {e[2] for e in entries}
-        if required <= have:
-            extra = sorted(have - required)
-            emit(f"{typename}  (extra: {', '.join(extra) if extra else 'none'})")
-    emit(
-        "\nnote: name-based method-set cover. It ignores signatures and does not "
-        "expand embedded/inherited members, so verify before relying on it."
-    )
+    # Constructors, destructors and operators are not part of a contract.
+    required = {
+        r
+        for r in required
+        if r not in (wanted, f"~{wanted}") and not r.startswith("operator")
+    }
+
+    implementors = []
+    for typename in sorted(parents):
+        chain = _declared_path(typename, wanted, parents)
+        if chain is None or typename == wanted:
+            continue
+        path, src, spec, offset, node = (types.get(typename) or [(None,) * 5])[0]
+        implementors.append(
+            {
+                "name": typename,
+                "file": path,
+                "line": line_of(src, node, offset) if node is not None else None,
+                "via": "declared",
+                "through": chain[:-1],
+                "extra": [],
+            }
+        )
+    declared_names = {i["name"] for i in implementors}
+    structural = bool(langs & _STRUCTURAL) or not (langs & _DECLARED_ONLY)
+    if structural and required:
+        for typename, entries in sorted(
+            method_sets(root, opts, skip_ifaces=True).items()
+        ):
+            have = {e[2] for e in entries}
+            if typename in declared_names or not required <= have:
+                continue
+            implementors.append(
+                {
+                    "name": typename,
+                    "file": entries[0][0],
+                    "line": entries[0][1],
+                    "via": "structural",
+                    "through": [],
+                    "extra": sorted(have - required),
+                }
+            )
+
+    if opts["json"]:
+        emit(
+            {
+                "interface": wanted,
+                "requires": sorted(required),
+                "implementors": implementors,
+            }
+        )
+        return
+    if required:
+        emit(f"interface {wanted} requires: {', '.join(sorted(required))}\n")
+    else:
+        emit(f"interface {wanted} declares no methods of its own\n")
+    declared = [i for i in implementors if i["via"] == "declared"]
+    matched = [i for i in implementors if i["via"] == "structural"]
+    if declared:
+        emit("declared (implements/extends clause, followed through the hierarchy):")
+        for item in declared:
+            through = f"  via {' -> '.join(item['through'])}" if item["through"] else ""
+            where = f"  ({item['file']}:{item['line']})" if item["file"] else ""
+            emit(f"  {item['name']}{where}{through}")
+    if matched:
+        if declared:
+            emit("")
+        emit("structural (method names only, no implements clause):")
+        for item in matched:
+            extra = ", ".join(item["extra"]) if item["extra"] else "none"
+            emit(f"{item['name']}  (extra: {extra})")
+    if not implementors:
+        emit("no implementors found")
+    if matched:
+        emit(
+            "\nnote: a structural match compares method names. It ignores "
+            "signatures and does not expand embedded/inherited members, so verify "
+            "before relying on it."
+        )
+    elif not structural:
+        emit(
+            f"\nnote: {', '.join(sorted(langs))} state(s) contracts in an implements/"
+            "extends clause, so only declared implementors are listed."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -2311,30 +3757,36 @@ def is_contract(node, spec):
     return False
 
 
-def collect_declarations(root, opts):
+def collect_declarations(root, opts, on_type=None):
     """-> (nodes, by_name, by_func, contract_keys)
 
-    The key is `path:line`, which is unique and stable regardless of how many
-    same-named declarations the repo has. `label` is what a human wants to read.
-    `by_func` holds functions only: a value handed to a call is a callback when
-    it names a function, and a variable sharing a name with a *type* is the
-    commonest false positive there is. `contract_keys` holds the declarations
-    that are interface members rather than implementations.
+    The key is `path:line:column` (decl_key), unique even when two declarations
+    share a line. `label` is what a human wants to read. `by_func` holds
+    functions only: a value handed to a call is a callback when it names a
+    function, and a variable sharing a name with a *type* is the commonest
+    false positive there is. `contract_keys` holds the declarations that are
+    interface members rather than implementations.
+
+    Candidate tuples are (path, line, owner, key).
     """
     nodes = {}
     by_name = {}
     by_func = {}
     contract_keys = set()
     for path, src, tree, spec, offset in iter_parsed(root, opts):
+        if on_type is not None:
+            on_type(None, spec, tree)
         for node in walk_decls(
             tree.root_node, spec, tuple(set(spec.defs) | set(spec.types))
         ):
+            if on_type is not None and node.type in spec.types:
+                on_type(node, spec, tree)
             name = resolve_name(node, spec)
             if not name or name == "<anonymous>":
                 continue
             line = line_of(src, node, offset)
             owner = receiver_type(node, spec)
-            key = f"{path}:{line}"
+            key = decl_key(path, node, src, offset)
             names = decl_names(node, spec)
             nodes[key] = {
                 "path": path,
@@ -2346,24 +3798,49 @@ def collect_declarations(root, opts):
                 "aliases": sorted(names),
             }
             for alias in {canon(n, spec) for n in names}:
-                by_name.setdefault(alias, []).append((path, line, owner))
+                by_name.setdefault(alias, []).append((path, line, owner, key))
                 if node.type in spec.defs:
-                    by_func.setdefault(alias, []).append((path, line, owner))
+                    by_func.setdefault(alias, []).append((path, line, owner, key))
             if is_contract(node, spec):
                 contract_keys.add(key)
     return nodes, by_name, by_func, contract_keys
 
 
-def external_heads(root, opts):
-    """-> {path: {head, ...}} for imports that resolve outside this repo.
+_IMPORT_WORDS = frozenset(
+    {
+        "import",
+        "from",
+        "as",
+        "use",
+        "using",
+        "require",
+        "const",
+        "let",
+        "var",
+        "type",
+        "static",
+        "crate",
+        "self",
+        "super",
+        "package",
+        "export",
+        "default",
+        "include",
+        "module",
+    }
+)
 
-    `rand.New(...)` after `import "math/rand"` has nothing to do with a local
-    `New`, but the name matches, so without this every stdlib call drags the
-    repo's own same-named declarations into the candidate list. Imports that do
-    resolve to a file in the repo are left alone: `queue.Push` after
-    `import { queue } from "./queue"` is a real edge worth following.
+
+def _module_index(root, opts):
+    """-> (by_module, by_suffix).
+
+    by_module maps a file's path, its path without extension, its path
+    relative to the root (without extension) and that path's directory to the
+    file. by_suffix maps every trailing run of path segments of the relative
+    paths (`gson/Gson`, `Gson`, ...) to the files ending in it, so a module path
+    resolves with one lookup instead of a scan over every file.
     """
-    by_module, by_stem = {}, {}
+    by_module, by_suffix = {}, {}
     for path, _, _, _, _ in iter_parsed(root, opts):
         stem, _ = os.path.splitext(path)
         by_module[stem] = path
@@ -2371,27 +3848,54 @@ def external_heads(root, opts):
         rel = os.path.relpath(stem, root).replace(os.sep, "/")
         by_module.setdefault(rel, path)
         by_module.setdefault(os.path.dirname(rel), path)
-        by_stem.setdefault(os.path.basename(stem), []).append(path)
+        for key in {rel, os.path.dirname(rel)}:
+            parts = [p for p in key.split("/") if p not in ("", ".")]
+            for start in range(len(parts)):
+                by_suffix.setdefault("/".join(parts[start:]), set()).add(by_module[key])
+    return by_module, by_suffix
 
-    heads = {}
+
+def import_heads(root, opts):
+    """-> (outside, inside): {path: {head, ...}} for each file's imports.
+
+    `rand.New(...)` after `import "math/rand"` has nothing to do with a local
+    `New`, but the name matches, so without this every stdlib call drags the
+    repo's own same-named declarations into the candidate list. Imports that do
+    resolve to a file in the repo bind names that are modules of this repo:
+    `queue.Push` after `import { queue } from "./queue"` is a real edge.
+    """
+    by_module, by_stem = _module_index(root, opts)
+    outside, inside = {}, {}
     for path, _, tree, spec, _ in iter_parsed(root, opts):
         for node in walk(tree.root_node, spec.imports):
             if not is_import_node(node, spec):
                 continue
             for target in import_targets(node, spec, path):
-                if resolve_import(target, path, root, by_module, by_stem, spec):
-                    continue
+                internal = resolve_import(target, path, root, by_module, by_stem, spec)
+                bucket = inside if internal else outside
                 if spec.key == "python":
-                    heads.setdefault(path, set()).update(_python_bound_names(node))
+                    bucket.setdefault(path, set()).update(_python_bound_names(node))
                     continue
                 tail = target.replace("\\", "/").rstrip("/").split("/")[-1]
-                tail = tail.split(".")[0].strip("\"'")
+                tail = re.split(r"::|\.", tail.strip("\"'"))[-1 if "::" in tail else 0]
                 if tail:
-                    heads.setdefault(path, set()).add(tail)
+                    bucket.setdefault(path, set()).add(tail)
                 alias = field(node, "name")
                 if alias and alias.isidentifier():
-                    heads.setdefault(path, set()).add(alias)
-    return heads
+                    bucket.setdefault(path, set()).add(alias)
+                if internal:
+                    unquoted = re.sub(r"(['\"]).*?\1", " ", text(node))
+                    bucket.setdefault(path, set()).update(
+                        w
+                        for w in re.findall(r"[A-Za-z_$][\w$]*", unquoted)
+                        if w not in _IMPORT_WORDS
+                    )
+    return outside, inside
+
+
+def external_heads(root, opts):
+    """Heads of imports that resolve outside this repo (kept for callers)."""
+    return import_heads(root, opts)[0]
 
 
 _SHELLS = frozenset({"bash", "fish", "powershell"})
@@ -2404,20 +3908,41 @@ def build_graph(root, opts):
     Where several survive, the call becomes an *unresolved* entry instead: a
     guessed edge that reads like a fact is worse than an admitted gap, and
     interface dispatch -- the case that matters most -- is precisely the case
-    that stays ambiguous.
+    that stays ambiguous. A call on a receiver whose type the syntax does not
+    give is unresolved too (kind `receiver`), however few candidates it has.
     """
-    nodes, by_name, by_func, contract_keys = collect_declarations(root, opts)
-    outside = external_heads(root, opts)
+    resolver = Resolver(root, opts)
+    nodes, by_name, by_func, contract_keys = (
+        resolver.nodes,
+        resolver.by_name,
+        resolver.by_func,
+        resolver.contract_keys,
+    )
+    outside = resolver.outside
     out_edges, in_edges, unresolved = {}, {}, []
+
+    def open_end(caller, expr, path, line, kind, candidates):
+        unresolved.append(
+            {
+                "caller": caller,
+                "expr": expr,
+                "path": path,
+                "line": line,
+                "kind": kind,
+                "candidates": candidates,
+            }
+        )
 
     for path, src, tree, spec, offset in iter_parsed(root, opts):
         for node, qualified in iter_calls(tree.root_node, spec):
-            line = line_of(src, node, offset)
+            if spec.key == "nix" and node.type == "path_expression":
+                continue  # file references: cycles and refs <file>, not calls
+            line = site_line(node, spec, src, offset, qualified)
             owner_node = enclosing_def(node, spec)
             caller = (
-                f"{path}:{line_of(src, owner_node, offset)}"
+                decl_key(path, owner_node, src, offset)
                 if owner_node is not None
-                else f"{path}:0"
+                else f"{path}:0:0"
             )
             if caller not in nodes:
                 nodes.setdefault(
@@ -2435,16 +3960,7 @@ def build_graph(root, opts):
             if spec.key in _SHELLS and "$" in qualified:
                 # `_item_$name`, `"$handler"`, `& $cmd`: the command name is
                 # built at runtime. No edge can be drawn, but it must not vanish.
-                unresolved.append(
-                    {
-                        "caller": caller,
-                        "expr": qualified,
-                        "path": path,
-                        "line": line,
-                        "kind": "dynamic",
-                        "candidates": [],
-                    }
-                )
+                open_end(caller, qualified, path, line, "dynamic", [])
                 continue
             kind = "reference" if is_reference(node, spec) else "call"
             targets = [(canon(bare_name(qualified, spec), spec), qualified, kind)]
@@ -2460,51 +3976,48 @@ def build_graph(root, opts):
                 if len(bare) < 3 or bare not in table:
                     continue
                 pool = table[bare]
+                mode, detail = resolver.classify(expr, node, spec, path, src)
+                if mode == "binding":
+                    key = decl_key(path, detail, src, offset)
+                    if key in nodes and key != caller:
+                        edge = (caller, key, path, line, kind, "EXTRACTED")
+                        out_edges.setdefault(caller, []).append(edge)
+                        in_edges.setdefault(key, []).append(edge)
+                    continue
+                pool, prefer, verdict = resolver.narrow(
+                    mode, detail, pool, spec, callback=kind == "callback"
+                )
+                if verdict == "drop":
+                    continue
+                if verdict == "receiver":
+                    open_end(caller, expr, path, line, "receiver", [c[3] for c in pool])
+                    continue
 
                 # A name shared by an interface member and its implementations
                 # is dynamic dispatch. The syntax records which contract is
                 # being called and says nothing about which body runs, so the
                 # only honest answer is the candidate list.
-                implementations = [
-                    c for c in pool if f"{c[0]}:{c[1]}" not in contract_keys
-                ]
+                implementations = [c for c in pool if c[3] not in contract_keys]
                 dispatched = len(implementations) != len(pool)
                 if dispatched and len(implementations) != 1:
-                    unresolved.append(
-                        {
-                            "caller": caller,
-                            "expr": expr,
-                            "path": path,
-                            "line": line,
-                            "kind": "dispatch",
-                            "candidates": [f"{c[0]}:{c[1]}" for c in pool],
-                        }
-                    )
+                    open_end(caller, expr, path, line, "dispatch", [c[3] for c in pool])
                     continue
                 if dispatched:
                     pool = implementations
 
                 ranked, confidence = resolve_call(
-                    expr, node, spec, path, src, offset, pool
+                    expr, node, spec, path, src, offset, pool, prefer
                 )
-                if dispatched:
+                if dispatched or (mode == "capped" and confidence == "EXTRACTED"):
                     # One implementor is a strong guess, not a fact: another may
-                    # live outside this repo.
+                    # live outside this repo. A Nix attribute selected off a
+                    # free name is a name match, not a binding read off scope.
                     confidence = "INFERRED"
                 if not ranked:
                     continue
-                best = f"{ranked[0][0]}:{ranked[0][1]}"
+                best = ranked[0][3]
                 if confidence == "AMBIGUOUS":
-                    unresolved.append(
-                        {
-                            "caller": caller,
-                            "expr": expr,
-                            "path": path,
-                            "line": line,
-                            "kind": kind,
-                            "candidates": [f"{c[0]}:{c[1]}" for c in ranked],
-                        }
-                    )
+                    open_end(caller, expr, path, line, kind, [c[3] for c in ranked])
                     continue
                 if best == caller or best not in nodes:
                     continue
@@ -2541,11 +4054,19 @@ def seed_keys(nodes, name):
     )
 
 
+def _node_ref(nodes, key):
+    node = nodes[key]
+    return {"name": node["label"], "file": node["path"], "line": node["line"]}
+
+
 def cmd_trace(name, root, opts, emit):
     nodes, out_edges, in_edges, unresolved = build_graph(root, opts)
     seeds = seed_keys(nodes, name)
     if not seeds:
-        emit(f"no declaration matching {name!r} found under {root}")
+        if opts["json"]:
+            emit({"seeds": [], "edges": [], "unresolved": []})
+        else:
+            emit(f"no declaration matching {name!r} found under {root}")
         return
 
     depth = int(opts.get("depth", 3))
@@ -2557,7 +4078,8 @@ def cmd_trace(name, root, opts, emit):
         direction, sources = "callees", (out_edges,)
 
     visited = set(seeds)
-    reported = []
+    edges_out = []
+    lines = []
 
     def expand(key, level, prefix):
         if level >= depth:
@@ -2574,12 +4096,22 @@ def cmd_trace(name, root, opts, emit):
             _, _, epath, eline, kind, confidence = edge
             node = nodes[other]
             repeat = other in visited
-            emit(
+            lines.append(
                 f"{prefix}{arrow} {node['label']}  ({node['path']}:{node['line']})"
                 f"  [{kind}, {confidence}]  at {epath}:{eline}"
                 + ("  (already shown)" if repeat else "")
             )
-            reported.append((other, edge))
+            edges_out.append(
+                {
+                    "depth": level + 1,
+                    "from": _node_ref(nodes, key if arrow == "->" else other),
+                    "to": _node_ref(nodes, other if arrow == "->" else key),
+                    "kind": kind,
+                    "label": confidence,
+                    "at": {"file": epath, "line": eline},
+                    "repeat": repeat,
+                }
+            )
             if repeat:
                 continue
             visited.add(other)
@@ -2587,15 +4119,41 @@ def cmd_trace(name, root, opts, emit):
 
     for seed in seeds:
         node = nodes[seed]
-        emit(f"{node['label']}  ({node['path']}:{node['line']})")
+        lines.append(f"{node['label']}  ({node['path']}:{node['line']})")
         expand(seed, 0, "  ")
-        emit("")
+        lines.append("")
 
     open_ends = [item for item in unresolved if item["caller"] in visited]
+    if opts["json"]:
+        emit(
+            {
+                "direction": direction,
+                "depth": depth,
+                "seeds": [_node_ref(nodes, seed) for seed in seeds],
+                "edges": edges_out,
+                "unresolved": [
+                    {
+                        "from": _node_ref(nodes, item["caller"]),
+                        "expr": item["expr"],
+                        "kind": item["kind"],
+                        "at": {"file": item["path"], "line": item["line"]},
+                        "candidates": [
+                            _node_ref(nodes, c)
+                            for c in item["candidates"]
+                            if c in nodes
+                        ],
+                    }
+                    for item in open_ends
+                ],
+            }
+        )
+        return
+    for line in lines:
+        emit(line)
     if open_ends:
         emit(
             "unresolved (no single target: several candidates survived ranking, "
-            "or the name is computed at runtime):"
+            "the receiver's type is unknown, or the name is computed at runtime):"
         )
         for item in open_ends[:25]:
             caller = nodes[item["caller"]]["label"]
@@ -2608,15 +4166,21 @@ def cmd_trace(name, root, opts, emit):
                     "      (name computed at runtime; read the code to see what it can be)"
                 )
             for candidate in item["candidates"][:4]:
-                emit(f"      candidate: {nodes[candidate]['label']}  ({candidate})")
+                target = nodes.get(candidate)
+                if target is not None:
+                    emit(
+                        f"      candidate: {target['label']}  ({target['path']}:{target['line']})"
+                    )
+            if len(item["candidates"]) > 4:
+                emit(f"      ... {len(item['candidates']) - 4} more candidates")
         if len(open_ends) > 25:
             emit(f"  ... {len(open_ends) - 25} more")
 
     emit(
         f"\ndirection {direction}, depth {depth}. Edges are name-based, not type-"
-        "resolved: an interface call, a reflected call, or a call through a "
-        "generated client leaves no edge here. Verify an INFERRED hop before "
-        "relying on it."
+        "resolved: an interface call, a reflected call, a call on a receiver "
+        "whose type is not written down, or a call through a generated client "
+        "leaves no edge here. Verify an INFERRED hop before relying on it."
     )
 
 
@@ -2789,8 +4353,32 @@ def is_import_node(node, spec):
     """
     hook = spec.import_hook
     if hook == "nix_import":
+        if node.type == "path_expression":
+            return nix_path_kind(node) in ("import", "callPackage", "imports")
         fn = node.child_by_field_name("function")
-        return fn is not None and text(fn).strip() == "import"
+        argument = node.child_by_field_name("argument")
+        # `import ./x` is listed through its path literal; only a computed
+        # `import "${p}/x.nix"` is listed here.
+        return (
+            fn is not None
+            and text(fn).strip() == "import"
+            and (argument is None or argument.type != "path_expression")
+        )
+    if hook == "js_import":
+        if node.type == "call_expression":
+            # CommonJS `require('./x')` is an import too.
+            fn = node.child_by_field_name("function")
+            args = node.child_by_field_name("arguments")
+            return (
+                fn is not None
+                and text(fn) == "require"
+                and args is not None
+                and args.named_child_count == 1
+                and args.named_children[0].type in ("string", "template_string")
+            )
+        if node.type == "export_statement":
+            return node.child_by_field_name("source") is not None  # re-export
+        return True
     if hook == "shell_source":
         return field(node, "name") in ("source", ".")
     if hook == "ps_import":
@@ -2895,9 +4483,24 @@ _RELATIVE_IMPORTS = frozenset({"css", "html", "bash", "fish", "powershell"})
 
 
 def resolve_import(target, importer, root, by_module, by_stem, spec=None):
-    """Map an import target onto a file in this repo, or None if external."""
+    """Map an import target onto a file in this repo, or None if external.
+
+    Go, Rust and C/C++ name modules their own way and get their own resolver.
+    Everything else is a path relative to the importer, or a dotted module
+    matched by its trailing segments.
+    """
     if not target:
         return None
+    key = spec.key if spec is not None else None
+    if key == "go":
+        return _resolve_go(target, importer, root, by_module)
+    if key == "rust":
+        return _resolve_rust(target, importer, by_module)
+    if key in ("c", "cpp"):
+        return _resolve_include(target, importer, by_module)
+    if key == "nix":
+        dest, _ = nix_path_target_text(target, importer)
+        return by_module.get(dest) if dest else None
     if (
         spec is not None
         and spec.key in _RELATIVE_IMPORTS
@@ -2910,7 +4513,23 @@ def resolve_import(target, importer, root, by_module, by_stem, spec=None):
     if normalised.startswith("."):
         base = os.path.dirname(importer)
         candidate = os.path.normpath(os.path.join(base, normalised))
-        for suffix in ("", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs"):
+        # TypeScript ESM imports name the emitted file: `./queue.js` is
+        # queue.ts in the source tree.
+        root_part, ext = os.path.splitext(candidate)
+        if ext in (".js", ".jsx", ".mjs", ".cjs") and candidate not in by_module:
+            candidate = root_part
+        for suffix in (
+            "",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".cjs",
+            ".py",
+            ".go",
+            ".rs",
+        ):
             hit = by_module.get(candidate + suffix)
             if hit:
                 return hit
@@ -2920,17 +4539,208 @@ def resolve_import(target, importer, root, by_module, by_stem, spec=None):
                     return hit
         return None
 
-    for prefix_len in range(normalised.count("/") + 1, 0, -1):
-        tail = "/".join(normalised.split("/")[-prefix_len:])
-        hit = by_module.get(tail)
-        if hit:
-            return hit
-
-    stem = normalised.split("/")[-1].split(".")[-1]
-    matches = by_stem.get(stem)
-    if matches and len(matches) == 1:
-        return matches[0]
+    # A module path (`flask.wrappers`, `com.google.gson.Gson`) names a file by
+    # its trailing directories. One segment alone (`json`, `lodash`) matches
+    # only at the repo root or under src/: otherwise every stdlib or package
+    # import with a common name lands on a local file.
+    stem, ext = os.path.splitext(normalised)
+    wanted = stem if ext.lower() in _SOURCE_EXTS else normalised
+    if "/" not in wanted and "." in wanted:
+        wanted = wanted.replace(".", "/")  # com.google.gson.Gson
+    head, _, rest = wanted.partition("/")
+    if head in _PATH_ALIASES and rest:
+        wanted = rest  # `~/types`, `@/store/repos`: an alias for the source root
+    if "/" not in wanted:
+        for key in (wanted, f"src/{wanted}"):
+            if key in by_module and not os.path.isabs(key):
+                return by_module[key]
+        return None
+    parts = wanted.split("/")
+    # Longest match first, at least two segments. Dropping trailing segments
+    # covers member imports (`import static a.b.C.member`, `from a.b import
+    # c`); dropping leading ones covers path aliases (`~/modules/i18n`,
+    # `@/store/repos`) whose root the resolver does not know.
+    for length in range(len(parts), 1, -1):
+        for start in (len(parts) - length, len(parts) - 1 - length):
+            if start < 0:
+                continue
+            hits = by_stem.get("/".join(parts[start : start + length]))
+            if hits:
+                return min(hits, key=lambda hit: (path_distance(hit, importer), hit))
     return None
+
+
+# Prefixes bundlers map to the source root (vite/webpack/nuxt/sveltekit).
+_PATH_ALIASES = frozenset({"~", "@", "#", "~~", "@@", "$lib", "src"})
+
+_SOURCE_EXTS = frozenset(ext for spec in ALL for ext in spec.exts)
+
+_GO_MODULES = {}
+
+
+def _go_module(directory, root):
+    """(module path, go.mod directory) of the nearest go.mod at or above
+    *directory*, stopping at the scan root; (None, None) without one."""
+    stop = os.path.abspath(root)
+    cur = os.path.abspath(directory)
+    while True:
+        if cur in _GO_MODULES:
+            return _GO_MODULES[cur]
+        gomod = os.path.join(cur, "go.mod")
+        if os.path.isfile(gomod):
+            try:
+                with open(gomod, encoding="utf8", errors="replace") as handle:
+                    match = re.search(r"(?m)^\s*module\s+(\S+)", handle.read())
+            except OSError:
+                match = None
+            found = (match.group(1).strip("\"'"), cur) if match else (None, None)
+            _GO_MODULES[cur] = found
+            return found
+        parent = os.path.dirname(cur)
+        if cur == stop or parent == cur:
+            return None, None
+        cur = parent
+
+
+def _resolve_go(target, importer, root, by_module):
+    """Only imports under this module's path are in the repo: `os/exec` is the
+    standard library even when the repo has a `cli/exec` directory."""
+    module, moddir = _go_module(os.path.dirname(importer), root)
+    if not module or not (target == module or target.startswith(module + "/")):
+        return None
+    package = os.path.join(moddir, target[len(module) + 1 :])
+    rel = os.path.relpath(package, os.path.abspath(root)).replace(os.sep, "/")
+    return by_module.get("" if rel == "." else rel)
+
+
+def _rust_module_dir(importer):
+    """Directory holding the child modules of the module defined by a file."""
+    base = os.path.basename(importer)
+    if base in ("mod.rs", "lib.rs", "main.rs"):
+        return os.path.dirname(importer)
+    return os.path.splitext(importer)[0]
+
+
+def _rust_crate_src(importer):
+    cur = os.path.dirname(os.path.abspath(importer))
+    while True:
+        if os.path.isfile(os.path.join(cur, "Cargo.toml")):
+            return os.path.join(cur, "src")
+        if any(os.path.isfile(os.path.join(cur, f)) for f in ("lib.rs", "main.rs")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _resolve_rust(target, importer, by_module):
+    """`crate::a::b::Item`, `super::x`, `self::y` -> the file of the module."""
+    path = re.split(r"\s*[{;]", target.replace(" ", ""))[0].strip(":")
+    parts = [p for p in path.split("::") if p and p != "*"]
+    if not parts:
+        return None
+    if parts[0] == "crate":
+        base, parts = _rust_crate_src(importer), parts[1:]
+        if base is None:
+            return None
+        # by_module is keyed by the importer's own path form, absolute or not
+        if not os.path.isabs(importer):
+            base = os.path.relpath(base)
+    elif parts[0] in ("self", "super"):
+        base = _rust_module_dir(importer)
+        while parts and parts[0] in ("self", "super"):
+            if parts[0] == "super":
+                base = os.path.dirname(base)
+            parts = parts[1:]
+    else:
+        return None  # another crate, std or core
+    for size in range(len(parts), 0, -1):
+        candidate = os.path.normpath(os.path.join(base, *parts[:size]))
+        for name in (candidate + ".rs", os.path.join(candidate, "mod.rs")):
+            hit = by_module.get(name)
+            if hit:
+                return hit
+    return None
+
+
+def _resolve_include(target, importer, by_module):
+    """`#include "x.h"`: beside the includer first, then any repo file whose
+    path ends with the include path, nearest first."""
+    target = target.strip("<>\"' ")
+    beside = os.path.normpath(os.path.join(os.path.dirname(importer), target))
+    if beside in by_module:
+        return by_module[beside]
+    suffix = os.sep + os.path.normpath(target)
+    files = {p for p in by_module.values() if p.endswith(suffix) or p == target}
+    if not files:
+        return None
+    return min(files, key=lambda p: (path_distance(p, importer), p))
+
+
+def nix_path_target_text(literal, importer):
+    if "${" in literal or not literal.startswith(("./", "../", ".")):
+        return None, literal
+    dest = os.path.normpath(os.path.join(os.path.dirname(importer), literal))
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, "default.nix")
+    return (dest, literal) if os.path.isfile(dest) else (None, literal)
+
+
+def _python_import_scope(node):
+    """'type-checking' for imports under `if TYPE_CHECKING:`, 'deferred' for
+    imports inside a function body, else None. Neither runs at import time,
+    so neither can make an import cycle; both are the usual cycle fixes."""
+    cur = node.parent
+    while cur is not None:
+        if cur.type == "if_statement":
+            condition = field(cur, "condition")
+            if condition.split(".")[-1].strip() == "TYPE_CHECKING":
+                return "type-checking"
+        if cur.type == "function_definition":
+            return "deferred"
+        cur = cur.parent
+    return None
+
+
+def cycle_edges(root, opts):
+    """-> (edges, files_by_lang, edges_by_lang, skipped, unresolved_nix)."""
+    by_module, by_stem = _module_index(root, opts)
+    edges, files_by_lang, edges_by_lang = {}, {}, {}
+    skipped = {"type-checking": 0, "deferred": 0}
+    unresolved_nix = []
+    for path, src, tree, spec, offset in iter_parsed(root, opts):
+        files_by_lang.setdefault(spec.key, set()).add(path)
+        if spec.key == "nix":
+            for node, kind, dest in nix_path_refs(tree, path):
+                if kind == "path":
+                    continue  # data, sources, assets: not a module edge
+                if dest is None:
+                    if "${" in text(node):
+                        unresolved_nix.append(
+                            (path, line_of(src, node, offset), text(node))
+                        )
+                    continue
+                dest = by_module.get(dest)
+                if dest and dest != path:
+                    edges.setdefault(path, set()).add(dest)
+                    edges_by_lang[spec.key] = edges_by_lang.get(spec.key, 0) + 1
+            continue
+        for node in walk(tree.root_node, spec.imports):
+            if not is_import_node(node, spec):
+                continue
+            if spec.key == "python":
+                scope = _python_import_scope(node)
+                if scope:
+                    skipped[scope] += 1
+                    continue
+            for target in import_targets(node, spec, path):
+                dest = resolve_import(target, path, root, by_module, by_stem, spec)
+                if dest and dest != path:
+                    if dest not in edges.get(path, ()):
+                        edges_by_lang[spec.key] = edges_by_lang.get(spec.key, 0) + 1
+                    edges.setdefault(path, set()).add(dest)
+    return edges, files_by_lang, edges_by_lang, skipped, unresolved_nix
 
 
 def cmd_cycles(root, opts, emit):
@@ -2940,56 +4750,74 @@ def cmd_cycles(root, opts, emit):
     a resolution step and it is where the uncertainty lives. Only cycles whose
     every edge resolved to a file inside this repo are reported.
     """
-    edges = {}
-    by_module = {}
-    by_stem = {}
-    files = []
-
-    for path, src, tree, spec, offset in iter_parsed(root, opts):
-        files.append(path)
-        stem, _ = os.path.splitext(path)
-        by_module[stem] = path
-        by_module[path] = path
-        rel = os.path.relpath(stem, root).replace(os.sep, "/")
-        by_module.setdefault(rel, path)
-        by_module.setdefault(os.path.dirname(rel), path)
-        by_stem.setdefault(os.path.basename(stem), []).append(path)
-
-    for path, src, tree, spec, offset in iter_parsed(root, opts):
-        for node in walk(tree.root_node, spec.imports):
-            if not is_import_node(node, spec):
-                continue
-            for target in import_targets(node, spec, path):
-                dest = resolve_import(target, path, root, by_module, by_stem, spec)
-                if dest and dest != path:
-                    edges.setdefault(path, set()).add(dest)
-
+    edges, files_by_lang, edges_by_lang, skipped, unresolved_nix = cycle_edges(
+        root, opts
+    )
+    files = set().union(*files_by_lang.values()) if files_by_lang else set()
     cycles = find_cycles(edges, max_len=int(opts.get("max_len", 6)))
+    blind = sorted(
+        lang
+        for lang, paths in files_by_lang.items()
+        if len(paths) > 1 and not edges_by_lang.get(lang)
+    )
+
+    if opts["json"]:
+        emit(
+            {
+                "cycles": [
+                    {"length": len(c), "files": [os.path.relpath(f, root) for f in c]}
+                    for c in cycles
+                ],
+                "edges_by_language": edges_by_lang,
+                "no_edges_resolved": blind,
+                "skipped_python_imports": skipped,
+                "unresolved_nix_paths": [
+                    {"file": p, "line": ln, "path": lit}
+                    for p, ln, lit in unresolved_nix
+                ],
+            }
+        )
+        return
+
     if not cycles:
         emit(
             f"no import cycles found among {len(files)} files "
             f"({sum(len(v) for v in edges.values())} internal import edges resolved)"
         )
-        return
-
-    if opts["json"]:
+    else:
+        emit(f"{len(cycles)} import cycle(s):\n")
+        for cycle in cycles:
+            shown = [os.path.relpath(f, root) for f in cycle]
+            emit(f"  [{len(cycle)}] " + " -> ".join(shown + [shown[0]]))
         emit(
-            [
-                {"length": len(c), "files": [os.path.relpath(f, root) for f in c]}
-                for c in cycles
-            ]
+            "\nImport targets are resolved to files by path and module name, so a "
+            "cycle through a re-exporting barrel file or an aliased path may be "
+            "missed. Reported cycles resolved fully; absence is weaker evidence."
         )
-        return
-
-    emit(f"{len(cycles)} import cycle(s):\n")
-    for cycle in cycles:
-        shown = [os.path.relpath(f, root) for f in cycle]
-        emit(f"  [{len(cycle)}] " + " -> ".join(shown + [shown[0]]))
-    emit(
-        "\nImport targets are resolved to files by path and module name, so a "
-        "cycle through a re-exporting barrel file or an aliased path may be "
-        "missed. Reported cycles resolved fully; absence is weaker evidence."
-    )
+    if skipped["type-checking"] or skipped["deferred"]:
+        emit(
+            f"\nnot counted: {skipped['type-checking']} Python import(s) under "
+            f"`if TYPE_CHECKING:` and {skipped['deferred']} inside function bodies; "
+            "neither runs at import time"
+        )
+    if blind:
+        emit(
+            f"\nno import edges resolved for: {', '.join(blind)}. Their imports name "
+            "namespaces or packages this resolver does not map to files, so the "
+            "absence of cycles there is no evidence."
+        )
+    if unresolved_nix:
+        emit(
+            f"\n{len(unresolved_nix)} Nix path reference(s) could not be resolved "
+            "(computed with ${...}):"
+        )
+        for path, line, literal in unresolved_nix[:10]:
+            emit(f"  {path}:{line}: {literal}")
+    elif not cycles:
+        emit(
+            "Import targets are resolved to files by path and module name; an "
+            "empty result is weaker evidence than a reported cycle."
+        )
 
 
 def find_cycles(edges, max_len=6, limit=25):
@@ -3107,6 +4935,8 @@ def run_command(cmd, args, opts, emit):
     languages it applies to and names the ones it skipped.
     """
     handler, arity = COMMANDS[cmd]
+    _EXCLUDED.clear()
+    _FILES_CACHE.clear()
     blocked = []
     index = _ROOT_ARG.get(cmd)
     if index is not None and len(args) > index:
@@ -3156,6 +4986,7 @@ def default_opts(**overrides):
     opts = {
         "tests": False,
         "mocks": False,
+        "vendored": False,
         "json": False,
         "no_gitignore": False,
         "callers": False,
@@ -3174,6 +5005,7 @@ def default_opts(**overrides):
 _SWITCHES = {
     "--tests": "tests",
     "--mocks": "mocks",
+    "--vendored": "vendored",
     "--json": "json",
     "--no-gitignore": "no_gitignore",
     "--callers": "callers",
@@ -3213,6 +5045,27 @@ def parse_args(argv):
     return opts, positional
 
 
+# Commands whose --json result is one object; every other command emits a
+# list of records, printed as a JSON array even when it has one element.
+_OBJECT_COMMANDS = frozenset({"map", "outline", "trace", "impls", "cycles"})
+
+
+def json_document(cmd, buffer):
+    if (
+        len(buffer) == 1
+        and isinstance(buffer[0], dict)
+        and "not_applicable" in buffer[0]
+    ):
+        return buffer[0]
+    if cmd in _OBJECT_COMMANDS:
+        return buffer[0] if buffer else {}
+    if len(buffer) == 1 and isinstance(buffer[0], list):
+        return buffer[0]  # effects and complexity emit their rows at once
+    return [item for item in buffer if not isinstance(item, str)] or [
+        {"message": item} for item in buffer
+    ]
+
+
 def main():
     opts, positional = parse_args(sys.argv[1:])
 
@@ -3242,7 +5095,7 @@ def main():
     try:
         run_command(cmd, rest[:arity], opts, emit)
         if opts["json"]:
-            print(json.dumps(buffer[0] if len(buffer) == 1 else buffer, indent=2))
+            print(json.dumps(json_document(cmd, buffer), indent=2))
     except BrokenPipeError:
         pass
     if _MISSING and cmd != "langs":  # langs already tabulates what is missing
@@ -3251,6 +5104,25 @@ def main():
             f"{' '.join(sorted(_MISSING))}]",
             file=sys.stderr,
         )
+    if _SQL_RECOVERED:
+        skipped = [
+            f"{path}:{line}"
+            for path, items in sorted(_SQL_RECOVERED.items())
+            for line, how in items
+            if how == "body skipped"
+        ]
+        total = sum(len(items) for items in _SQL_RECOVERED.values())
+        note = (
+            f"\n[sql: {total} statement(s) parsed only after blanking syntax the "
+            "grammar rejects (function attributes, OPERATOR(...), PL/pgSQL)"
+        )
+        if skipped:
+            extra = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+            note += (
+                f"; the bodies of {len(skipped)} routine(s) were not read, so "
+                f"references inside them are missing: {' '.join(skipped[:5])}{extra}"
+            )
+        print(note + "]", file=sys.stderr)
     if _PARSE_ERRORS:
         # tree-sitter recovers rather than failing, so a bad parse yields a
         # partial tree that looks exactly like a good one. Results from these

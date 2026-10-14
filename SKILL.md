@@ -31,8 +31,8 @@ Already set up: reused in about a second. After that, plain
 commands below work unchanged.
 
 Default profile `common` = Go, Rust, JavaScript, TypeScript, TSX, Vue, Nix,
-Python, Java, SQL, Bash, Fish, C, C#, C++, PowerShell, HTML, CSS. Kotlin, Swift,
-Scala, Ruby, PHP, Lua, Zig, Julia, Svelte: `--profile all` (needs PyPI). One
+Python, Java, SQL, Bash, Fish, C, C#, C++, PowerShell, HTML, CSS, PHP. Kotlin,
+Swift, Scala, Ruby, Lua, Zig, Julia, Svelte: `--profile all` (needs PyPI). One
 language: `--languages go,nix` (aliases ok: `ts`, `c#`, `pwsh`). No network
 allowed: `--offline` (fail naming what bundle lack, never half-install). NixOS:
 `nix run path/to/skill -- map .`. Flags, report fields, recovery:
@@ -128,8 +128,11 @@ before concluding anything from trace of async code.
   enclosing declaration. Call list double as call-graph sketch.
 - `todos` attribute each marker to containing declaration. Flat list become map
   of known debt.
-- `impls` derive implementors from method sets. No textual pattern exist for
-  "this type satisfy that interface" in Go or Rust.
+- `impls` read the `implements`/`extends`/base clause where language has one
+  (Java, C#, Kotlin, Swift, Scala, PHP, Rust `impl Trait for`, C++ bases),
+  following the declared hierarchy. Go, and structural matches in TS/Python,
+  come from method sets: no textual pattern exist for "this type satisfy that
+  interface" in Go.
 - `trace` keep following. Hand-walking a chain cost one `refs` plus one file read
   per hop, and skipped hop usually the one that mattered.
 - `effects` find handoffs that break a trace: goroutine, channel, encoder,
@@ -137,9 +140,12 @@ before concluding anything from trace of async code.
   is place where confident-looking trace quietly stop being true.
 
 Test files (`*_test.go`, `test_*.py`, `*.test.ts`, `*.spec.*`, `*.Tests.ps1`,
-`FooTest.java`, `FooTests.cs`), generated mocks, files with machine-written
-header: excluded by default. They dominate results, rarely answer question. Add `--tests` or
-`--mocks` when wanted. Credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`,
+`FooTest.java`, `FooTests.cs`, anything under `test/`, `tests/`, `__tests__/`,
+`spec/`, `testdata/`, `fixtures/`, `e2e/`), generated mocks, files with
+machine-written header, vendored dirs (`vendor/`, `third_party/`, `.yarn/`,
+`bower_components/`) and minified files: excluded by default. They dominate
+results, rarely answer question. `map` prints how many each rule left out. Add
+`--tests`, `--mocks` or `--vendored` when wanted. Credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`,
 `credentials.json`) never read at all. Files over 2 MB skipped as data, not source.
 
 ## Confidence labels
@@ -152,6 +158,8 @@ every edge with how much the answer can be trusted:
 | `EXTRACTED` | the callee is declared in this same file, and the call is bare or on `this`/`self` (or the Go receiver); safe to rely on |
 | `INFERRED` | exactly one plausible declaration survived ranking, in another file |
 | `AMBIGUOUS` | several remain; `refs` shows its best guess with a count of the rest |
+| `UNRESOLVED` | no target readable off syntax: receiver of unknown type or outside the repo, or link to a missing file |
+| `LOCAL` | a lambda parameter or local binding (Nix), not a declaration |
 
 `refs` also labels a hit `reference` when it names something without calling it:
 a SQL table read, a Nix attribute select, a CSS `var()`, an HTML link. A trigger's
@@ -164,6 +172,15 @@ listed there as `dynamic`. A call
 naming an interface member is separated out as `dispatch`, because that is not an
 ambiguity to be broken by better ranking: the target is chosen at runtime and is
 not written down anywhere in the file.
+
+A qualified call judged by receiver first, name second. `this`/`self`/Go
+receiver: enclosing type. Imported repo module or Go package: its functions.
+Type name: its static members. Local or parameter whose type written in the
+function (`s Store`, `s: Store`, `s := &Store{}`, `new Store()`, `Store s`), or
+field of typed receiver (`o.inner.Poll()`): that type's methods. Type outside
+repo (`ctx context.Context`, `Vec`): no edge. Anything else: receiver of unknown
+type, no edge, candidates listed as `receiver` under `unresolved`. A method call
+never resolves to free function where language forbids it.
 
 Ranking uses positional signals, not type information: production code is
 assumed not to call test fixtures, a nearer declaration in the directory tree
@@ -184,7 +201,10 @@ is worse than no result.
 --tests          include test files
 --mocks          include generated mocks and header-marked generated code
 --lang=<key>     restrict to one language (see `langs`; aliases like ts, c#, pwsh)
---json           machine-readable output, for piping into further analysis
+--json           structured output: one record per row (refs, decl, methods,
+                 fields, consts, todos, iface) or one object (map, outline,
+                 trace, impls, cycles)
+--vendored       include vendored dirs and minified files
 --no-gitignore   index everything, ignoring the repo's .gitignore
 --min=<n>        complexity: only report functions scoring at or above n
 --max-len=<n>    cycles: longest cycle to search for (default 6)
@@ -219,8 +239,9 @@ could not be resolved instead of inferring. See limits below.
 
 Syntactic analysis, not semantic. It does not resolve types, so:
 
-- `refs` matches the trailing identifier of a call. It shows `p.q.Poll` but
-  cannot prove `p.q` is a `*fifo`. Same-named methods on different types collide.
+- `refs` matches the trailing identifier of a call, then judges the receiver
+  (see Confidence labels). It types a receiver only from what is written in
+  the enclosing function or a field declaration; `x := build()` stays unknown.
 - `trace` is built from those same edges, so its reach is bounded by them. A
   reflected call, a call through a generated client, a handler resolved from a
   string route table, and an interface with several implementors all end the
@@ -229,12 +250,15 @@ Syntactic analysis, not semantic. It does not resolve types, so:
 - `effects` detects channels in Go only, and reports a callback whenever an
   argument names a function declared in this repo, so a local variable that
   shadows a function name shows up as one.
-- `impls` compares **method names only**, not signatures, and does not expand
-  embedded or inherited members. Treat it as a strong hint to verify, not proof.
-- `cycles` resolves import targets to files by path and module name. A cycle
-  routed through a re-exporting barrel file or a build-tool path alias can be
-  missed, so a reported cycle is solid evidence but an empty result is not proof
-  of absence.
+- `impls` with a declared clause is syntax, not guess. A structural match (Go,
+  TS/Python without clause) compares **method names only**, not signatures, and
+  does not expand embedded members: strong hint to verify, not proof.
+- `cycles` resolves import targets to files: relative paths, Go module paths
+  via `go.mod`, Rust `crate::`/`super::`, C `#include`, CommonJS `require`,
+  re-exports, dotted module paths by suffix, `~/`/`@/` aliases. Python imports
+  under `if TYPE_CHECKING:` or inside functions do not run at import time and
+  are counted apart. A language with no resolved edge (C# namespaces) is named:
+  no cycle there is no evidence. Reported cycle solid; empty result not proof.
 - `complexity` counts branch points structurally. It measures how many paths a
   reader must follow, which correlates with but is not the same as difficulty: a
   long flat switch scores high and is easy to read.
@@ -248,11 +272,17 @@ Syntactic analysis, not semantic. It does not resolve types, so:
   marks the file partial.
 - SQL is parsed one statement at a time, so a statement in a dialect the grammar
   does not know (T-SQL procedures, Oracle PL/SQL, Postgres `PARTITION OF`) costs
-  only itself. PostgreSQL and MySQL parse best. A table reference is syntax, not
-  proof the statement runs.
-- C and C++ are parsed without the preprocessor. Macro-heavy code
-  (`FMT_BEGIN_NAMESPACE`, X-macros) parses partially; declarations around the
-  macro are usually still found.
+  only itself. PostgreSQL (incl. `pg_dump`) and MySQL parse best; rejected
+  function headers and PL/pgSQL are masked and retried, and a routine whose body
+  still fails keeps its declaration with the body unread (stderr lists them). A
+  table reference is syntax, not proof the statement runs.
+- C and C++ are parsed without the preprocessor. Export/attribute macros
+  (`LUA_API`, `class LEVELDB_EXPORT DB`, `GUARDED_BY(mu)`) are blanked; other
+  macro-heavy code (`FMT_BEGIN_NAMESPACE`, X-macros) parses partially and
+  declarations around it are usually still found. `methods` includes
+  out-of-class `Type::method` definitions.
+- TypeScript `<in T>`/`<out T>`, CSS `6.5% {` and Bash `${x//&/..}` are not in
+  their grammars; they are masked on error and parsed again.
 - PowerShell's grammar rejects some common forms (`$x = {}`, `Get-Module A, B`,
   `param (`), present at upstream HEAD too. Error recovery still finds about 96%
   of functions. Names match case-insensitively, as PowerShell does.
@@ -271,6 +301,9 @@ Syntactic analysis, not semantic. It does not resolve types, so:
   `refs` reports attribute references as well as applications, since a purely
   functional language draws no line between using a value and calling it.
   Laziness means the graph shows what refers to what, never what runs when.
+  Names follow lexical scope: a lambda argument is `LOCAL`, a `let` name resolves
+  to its binding. `import ./x`, `callPackage ./p.nix`, `imports = [ ./m ]` are
+  file edges for `cycles` and `refs <file>`; `./${x}.nix` is listed unresolved.
 
 When a question genuinely needs type resolution, say so and reach for the
 language's own tooling (`gopls`, `rust-analyzer`, `tsc`, an LSP) instead of
